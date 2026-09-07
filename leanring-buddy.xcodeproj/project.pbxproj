@@ -37,6 +37,9 @@
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		28F22CC12F56440300A0FC59 /* leanring-buddy */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				28F22CC12F56440300A0FC60 /* PBXFileSystemSynchronizedBuildFileExceptionSet */,
+			);
 			path = "leanring-buddy";
 			sourceTree = "<group>";
 		};
@@ -51,6 +54,16 @@
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		28F22CC12F56440300A0FC60 /* Exceptions for "leanring-buddy" folder in "leanring-buddy" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 28F22CBE2F56440300A0FC59 /* leanring-buddy */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		28F22CBC2F56440300A0FC59 /* Frameworks */ = {
@@ -484,7 +497,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 6D7X9GGZAW;
+				DEVELOPMENT_TEAM = 3V8CT3DK3A;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
 				MARKETING_VERSION = 1.0;
@@ -495,7 +508,7 @@
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/leanring-buddy.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/leanring-buddy";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Clicky.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Clicky";
 			};
 			name = Debug;
 		};
@@ -505,7 +518,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 6D7X9GGZAW;
+				DEVELOPMENT_TEAM = 3V8CT3DK3A;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.2;
 				MARKETING_VERSION = 1.0;
@@ -516,7 +529,7 @@
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/leanring-buddy.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/leanring-buddy";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Clicky.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Clicky";
 			};
 			name = Release;
 		};
@@ -525,7 +538,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 6D7X9GGZAW;
+				DEVELOPMENT_TEAM = 3V8CT3DK3A;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.yourcompany.leanring-buddyUITests";
@@ -544,7 +557,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 6D7X9GGZAW;
+				DEVELOPMENT_TEAM = 3V8CT3DK3A;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.yourcompany.leanring-buddyUITests";
