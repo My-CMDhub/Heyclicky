@@ -7,6 +7,7 @@
 //  opens a floating panel with companion voice controls.
 //
 
+import AppKit
 import ServiceManagement
 import SwiftUI
 import Sparkle
@@ -34,6 +35,11 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--capture-smoke-test") {
+            runCaptureSmokeTest()
+            return
+        }
+
         print("🎯 Clicky: Starting...")
         print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
@@ -51,6 +57,43 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         }
         registerAsLoginItemIfNeeded()
         // startSparkleUpdater()
+    }
+
+    private func runCaptureSmokeTest() {
+        print("🧪 Clicky: capture smoke test starting")
+
+        Task { @MainActor in
+            do {
+                let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                let outputDirectory = URL(fileURLWithPath: "/private/tmp/heyclicky-capture-smoke-test", isDirectory: true)
+                try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+                print("🧪 Clicky: capture count = \(captures.count)")
+                for (index, capture) in captures.enumerated() {
+                    print("🧪 Clicky: capture[\(index + 1)] label=\(capture.label)")
+                    print("🧪 Clicky: capture[\(index + 1)] cursorScreen=\(capture.isCursorScreen)")
+                    print("🧪 Clicky: capture[\(index + 1)] displayFrame=\(capture.displayFrame.debugDescription)")
+                    print("🧪 Clicky: capture[\(index + 1)] displayPoints=\(capture.displayWidthInPoints)x\(capture.displayHeightInPoints)")
+                    print("🧪 Clicky: capture[\(index + 1)] screenshotPixels=\(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels)")
+
+                    let safeLabel = capture.label
+                        .lowercased()
+                        .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+                    let fileName = "capture-\(index + 1)-\(safeLabel.isEmpty ? "screen" : safeLabel).jpg"
+                    let fileURL = outputDirectory.appendingPathComponent(fileName)
+                    try capture.imageData.write(to: fileURL, options: .atomic)
+                    print("🧪 Clicky: wrote \(fileURL.path)")
+                    print("🧪 Clicky: \(capture.label) | \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) px | cursorScreen=\(capture.isCursorScreen)")
+                }
+
+                print("🧪 Clicky: capture smoke test finished")
+            } catch {
+                print("❌ Clicky: capture smoke test failed: \(error)")
+            }
+
+            NSApplication.shared.terminate(nil)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
