@@ -1,0 +1,326 @@
+//
+//  AccessibilitySnapshot.swift
+//  leanring-buddy
+//
+//  Phase 1 of J.A.R.V.I.S.: reads the structural description macOS apps
+//  publish for VoiceOver, so the agent can ground itself in named elements
+//  instead of guessing pixel coordinates from a screenshot.
+//
+
+import AppKit
+import ApplicationServices
+
+/// One element in an app's Accessibility tree, with its frame already
+/// converted out of AX coordinates into AppKit coordinates.
+struct AccessibilityElementNode {
+    let role: String
+    let subrole: String?
+    let title: String?
+    let value: String?
+    let frameInAppKitCoordinates: CGRect
+    let depth: Int
+    let children: [AccessibilityElementNode]
+}
+
+/// Bounds a tree walk and — critically — records that it was bounded.
+///
+/// A truncated tree is indistinguishable from a genuinely shallow app, so a
+/// silent cap would quietly teach us the wrong lesson about how AX behaves.
+struct AccessibilityWalkBudget {
+    let maximumDepth: Int
+    let maximumNodeCount: Int
+
+    private(set) var nodesVisited = 0
+    private(set) var wasTruncated = false
+
+    init(maximumDepth: Int, maximumNodeCount: Int) {
+        self.maximumDepth = maximumDepth
+        self.maximumNodeCount = maximumNodeCount
+    }
+
+    /// Returns true if a node at this depth may be visited, spending one slot.
+    /// Returns false and flags truncation when either limit is reached.
+    mutating func claimSlot(atDepth depth: Int) -> Bool {
+        guard depth < maximumDepth else {
+            wasTruncated = true
+            return false
+        }
+        guard nodesVisited < maximumNodeCount else {
+            wasTruncated = true
+            return false
+        }
+
+        nodesVisited += 1
+        return true
+    }
+}
+
+/// The result of one walk, carrying both the tree and what it cost.
+struct AccessibilityWindowSnapshot {
+    let rootNode: AccessibilityElementNode?
+    let applicationName: String
+    let bundleIdentifier: String
+    let walkDurationInSeconds: Double
+    let nodeCount: Int
+    let deepestLevelReached: Int
+    let wasTruncatedByBudget: Bool
+    let timedOutNodePaths: [String]
+    let nodesWithoutReadableFrame: Int
+}
+
+enum AccessibilitySnapshotError: Error {
+    case accessibilityPermissionNotGranted
+    case noFrontmostApplication
+    case noFocusedWindow
+}
+
+enum AccessibilityTreeWalker {
+
+    /// Converts a frame from Accessibility coordinates (origin at the TOP-LEFT
+    /// of the primary display, y growing downward) into AppKit coordinates
+    /// (origin at the BOTTOM-LEFT of the primary display, y growing upward).
+    ///
+    /// Both systems describe the same pixel; they disagree only about which
+    /// way is down. Skipping this conversion does not crash — it silently
+    /// mirrors every frame vertically, which is why it is unit tested.
+    static func convertAccessibilityFrameToAppKitFrame(
+        _ accessibilityFrame: CGRect,
+        primaryDisplayHeightInPoints: CGFloat
+    ) -> CGRect {
+        let appKitOriginY = primaryDisplayHeightInPoints
+            - accessibilityFrame.origin.y
+            - accessibilityFrame.height
+
+        return CGRect(
+            x: accessibilityFrame.origin.x,
+            y: appKitOriginY,
+            width: accessibilityFrame.width,
+            height: accessibilityFrame.height
+        )
+    }
+
+    /// Renders the tree as an indented text outline, two spaces per level.
+    static func serializeTreeToText(_ rootNode: AccessibilityElementNode) -> String {
+        var lines: [String] = []
+        appendSerializedLines(for: rootNode, into: &lines)
+        return lines.joined(separator: "\n")
+    }
+
+    private static func appendSerializedLines(
+        for node: AccessibilityElementNode,
+        into lines: inout [String]
+    ) {
+        let indentation = String(repeating: "  ", count: node.depth)
+        let titleFragment = node.title.map { " \"\($0)\"" } ?? ""
+        let valueFragment = node.value.map { " = \"\($0)\"" } ?? ""
+        let frameFragment = String(
+            format: "(%.0f, %.0f, %.0f, %.0f)",
+            node.frameInAppKitCoordinates.origin.x,
+            node.frameInAppKitCoordinates.origin.y,
+            node.frameInAppKitCoordinates.width,
+            node.frameInAppKitCoordinates.height
+        )
+
+        lines.append(indentation + node.role + titleFragment + valueFragment + " " + frameFragment)
+
+        for childNode in node.children {
+            appendSerializedLines(for: childNode, into: &lines)
+        }
+    }
+
+    /// Walks the focused window of the frontmost application.
+    ///
+    /// Every attribute read below is synchronous inter-process communication
+    /// with the target app. That is why each element gets a messaging timeout:
+    /// a beachballing app would otherwise block this process indefinitely.
+    ///
+    /// ponytail: runs on the calling thread and blocks it for the whole walk.
+    /// Fine for the dump runner; move to a background actor if the overlay
+    /// ever needs to walk while the UI stays responsive.
+    static func snapshotFocusedWindow(
+        maximumDepth: Int = 25,
+        maximumNodeCount: Int = 2000
+    ) throws -> AccessibilityWindowSnapshot {
+        guard AXIsProcessTrusted() else {
+            throw AccessibilitySnapshotError.accessibilityPermissionNotGranted
+        }
+
+        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else {
+            throw AccessibilitySnapshotError.noFrontmostApplication
+        }
+
+        let applicationElement = AXUIElementCreateApplication(frontmostApplication.processIdentifier)
+        AXUIElementSetMessagingTimeout(applicationElement, 0.5)
+
+        guard let focusedWindowElement = copyElementAttribute(
+            from: applicationElement,
+            attribute: kAXFocusedWindowAttribute
+        ) else {
+            throw AccessibilitySnapshotError.noFocusedWindow
+        }
+        AXUIElementSetMessagingTimeout(focusedWindowElement, 0.5)
+
+        // NSScreen.screens[0] is always the display whose origin is (0, 0) —
+        // the one AX measures every other display relative to.
+        let primaryDisplayHeightInPoints = NSScreen.screens.first?.frame.height ?? 0
+
+        var budget = AccessibilityWalkBudget(
+            maximumDepth: maximumDepth,
+            maximumNodeCount: maximumNodeCount
+        )
+        var deepestLevelReached = 0
+        var timedOutNodePaths: [String] = []
+        var nodesWithoutReadableFrame = 0
+
+        let walkStartedAt = Date()
+        let rootNode = buildNode(
+            from: focusedWindowElement,
+            depth: 0,
+            primaryDisplayHeightInPoints: primaryDisplayHeightInPoints,
+            budget: &budget,
+            deepestLevelReached: &deepestLevelReached,
+            timedOutNodePaths: &timedOutNodePaths,
+            nodesWithoutReadableFrame: &nodesWithoutReadableFrame
+        )
+        let walkDurationInSeconds = Date().timeIntervalSince(walkStartedAt)
+
+        return AccessibilityWindowSnapshot(
+            rootNode: rootNode,
+            applicationName: frontmostApplication.localizedName ?? "unknown",
+            bundleIdentifier: frontmostApplication.bundleIdentifier ?? "unknown",
+            walkDurationInSeconds: walkDurationInSeconds,
+            nodeCount: budget.nodesVisited,
+            deepestLevelReached: deepestLevelReached,
+            wasTruncatedByBudget: budget.wasTruncated,
+            timedOutNodePaths: timedOutNodePaths,
+            nodesWithoutReadableFrame: nodesWithoutReadableFrame
+        )
+    }
+
+    private static func buildNode(
+        from element: AXUIElement,
+        depth: Int,
+        primaryDisplayHeightInPoints: CGFloat,
+        budget: inout AccessibilityWalkBudget,
+        deepestLevelReached: inout Int,
+        timedOutNodePaths: inout [String],
+        nodesWithoutReadableFrame: inout Int
+    ) -> AccessibilityElementNode? {
+        guard budget.claimSlot(atDepth: depth) else { return nil }
+
+        deepestLevelReached = max(deepestLevelReached, depth)
+
+        let role = copyStringAttribute(from: element, attribute: kAXRoleAttribute) ?? "AXUnknown"
+        let subrole = copyStringAttribute(from: element, attribute: kAXSubroleAttribute)
+        let title = copyStringAttribute(from: element, attribute: kAXTitleAttribute)
+        let value = copyStringAttribute(from: element, attribute: kAXValueAttribute)
+
+        let frameReadResult = copyFrame(from: element)
+        if frameReadResult.didTimeOut {
+            timedOutNodePaths.append("\(role) at depth \(depth)")
+        } else if frameReadResult.frame == nil {
+            nodesWithoutReadableFrame += 1
+        }
+
+        let appKitFrame = convertAccessibilityFrameToAppKitFrame(
+            frameReadResult.frame ?? .zero,
+            primaryDisplayHeightInPoints: primaryDisplayHeightInPoints
+        )
+
+        var childNodes: [AccessibilityElementNode] = []
+        for childElement in copyChildElements(from: element) {
+            guard let childNode = buildNode(
+                from: childElement,
+                depth: depth + 1,
+                primaryDisplayHeightInPoints: primaryDisplayHeightInPoints,
+                budget: &budget,
+                deepestLevelReached: &deepestLevelReached,
+                timedOutNodePaths: &timedOutNodePaths,
+                nodesWithoutReadableFrame: &nodesWithoutReadableFrame
+            ) else { break }
+
+            childNodes.append(childNode)
+        }
+
+        return AccessibilityElementNode(
+            role: role,
+            subrole: subrole,
+            title: title,
+            value: value,
+            frameInAppKitCoordinates: appKitFrame,
+            depth: depth,
+            children: childNodes
+        )
+    }
+
+    private static func copyStringAttribute(from element: AXUIElement, attribute: String) -> String? {
+        var attributeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &attributeValue) == .success,
+              let stringValue = attributeValue as? String,
+              !stringValue.isEmpty else {
+            return nil
+        }
+        return stringValue
+    }
+
+    private static func copyElementAttribute(from element: AXUIElement, attribute: String) -> AXUIElement? {
+        var attributeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &attributeValue) == .success,
+              let attributeValue,
+              CFGetTypeID(attributeValue) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return (attributeValue as! AXUIElement)
+    }
+
+    private static func copyChildElements(from element: AXUIElement) -> [AXUIElement] {
+        var attributeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &attributeValue) == .success,
+              let childElements = attributeValue as? [AXUIElement] else {
+            return []
+        }
+        return childElements
+    }
+
+    /// Reads an element's frame, and reports *why* it failed when it does.
+    ///
+    /// A frame read fails for two unrelated reasons: the target app did not
+    /// answer in time (AXError.cannotComplete, i.e. our messaging timeout
+    /// fired), or the element genuinely publishes no position — plenty of
+    /// AXGroups do. Reporting both as one number would make a healthy app look
+    /// unreliable, so the caller gets to tell them apart.
+    private static func copyFrame(from element: AXUIElement) -> (frame: CGRect?, didTimeOut: Bool) {
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+
+        let positionResult = AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue)
+        let sizeResult = AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue)
+        let didTimeOut = positionResult == .cannotComplete || sizeResult == .cannotComplete
+
+        guard positionResult == .success,
+              sizeResult == .success,
+              let positionValue,
+              let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+            return (nil, didTimeOut)
+        }
+
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+            return (nil, didTimeOut)
+        }
+
+        return (CGRect(origin: position, size: size), false)
+    }
+}
+
+extension AccessibilityElementNode {
+    /// Every node in this subtree, including this one, as a flat list.
+    /// The overlay draws one box per entry.
+    func flattenedDescendants() -> [AccessibilityElementNode] {
+        [self] + children.flatMap { $0.flattenedDescendants() }
+    }
+}

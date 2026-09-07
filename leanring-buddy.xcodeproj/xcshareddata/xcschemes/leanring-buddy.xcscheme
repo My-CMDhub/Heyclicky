@@ -77,6 +77,14 @@
       <CommandLineArguments>
          <CommandLineArgument
             argument = "--capture-smoke-test"
+            isEnabled = "NO">
+         </CommandLineArgument>
+         <CommandLineArgument
+            argument = "--ax-dump"
+            isEnabled = "YES">
+         </CommandLineArgument>
+         <CommandLineArgument
+            argument = "--ax-overlay"
             isEnabled = "YES">
          </CommandLineArgument>
       </CommandLineArguments>

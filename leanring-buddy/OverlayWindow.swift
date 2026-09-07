@@ -879,3 +879,30 @@ private class AVPlayerNSView: NSView {
         playerLayer.frame = bounds
     }
 }
+
+/// Draws one outline per accessibility element, in AppKit coordinates.
+/// A box that appears vertically mirrored means the coordinate conversion
+/// in AccessibilityTreeWalker was skipped somewhere.
+struct AccessibilityElementBoxesView: View {
+    let elementNodes: [AccessibilityElementNode]
+    let screenFrame: CGRect
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(Array(elementNodes.enumerated()), id: \.offset) { _, elementNode in
+                let frame = elementNode.frameInAppKitCoordinates
+
+                Rectangle()
+                    .stroke(Color.cyan.opacity(0.7), lineWidth: 1)
+                    .frame(width: frame.width, height: frame.height)
+                    .position(
+                        x: frame.midX - screenFrame.origin.x,
+                        // SwiftUI's y grows downward like AX does, so the
+                        // AppKit frame is flipped back one final time here.
+                        y: screenFrame.height - (frame.midY - screenFrame.origin.y)
+                    )
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
