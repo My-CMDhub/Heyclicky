@@ -49,28 +49,14 @@ enum AccessibilityDumpRunner {
             let snapshot = try AccessibilityTreeWalker.snapshotFocusedWindow()
             try await writeArtefacts(for: snapshot)
 
-            if CommandLine.arguments.contains("--ax-overlay"),
-               let rootNode = snapshot.rootNode,
-               let screen = NSScreen.main {
-                let boxesView = AccessibilityElementBoxesView(
-                    elementNodes: rootNode.flattenedDescendants(),
-                    screenFrame: screen.frame
-                )
-                let panel = NSPanel(
-                    contentRect: screen.frame,
-                    styleMask: [.borderless, .nonactivatingPanel],
-                    backing: .buffered,
-                    defer: false
-                )
-                panel.level = .screenSaver
-                panel.isOpaque = false
-                panel.backgroundColor = .clear
-                panel.ignoresMouseEvents = true
-                panel.contentView = NSHostingView(rootView: boxesView)
-                panel.orderFrontRegardless()
-
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+            if CommandLine.arguments.contains("--ax-overlay") {
+                if let rootNode = snapshot.rootNode {
+                    await flashElementBoxes(for: rootNode, seconds: 12)
+                } else {
+                    print("⚠️  --ax-overlay: no root node to draw")
+                }
             }
+
         } catch AccessibilitySnapshotError.accessibilityPermissionNotGranted {
             print("❌ J.A.R.V.I.S.: Accessibility permission not granted.")
             print("   System Settings → Privacy & Security → Accessibility → enable this app.")
@@ -87,23 +73,89 @@ enum AccessibilityDumpRunner {
 
     static func runAction() async {
         for remainingSeconds in stride(from: 5, through: 1, by: -1) {
-            print("🧪 J.A.R.V.I.S.: focus System Settings — \(remainingSeconds)")
+            print("🧪 J.A.R.V.I.S.: focus System Settings (General pane) — \(remainingSeconds)")
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
 
-        // UNVERIFIED ASSUMPTION: "AXRow" is the role the plan guessed for the
-        // pressable System Settings sidebar element. Task 1 Step 6 — a live
-        // --ax-dump run — is what actually decides between AXRow, AXCell and
-        // AXStaticText. Correct both intents below after the first live run.
-        let reachableIntent = ElementActionIntent(role: "AXRow", title: "Accessibility", action: .press)
-        let unreachableIntent = ElementActionIntent(role: "AXRow", title: "Privacy & Security", action: .press)
+        // Measured 2026-09-08, not assumed. In System Settings AXPress exists only
+        // on AXButton: sidebar rows publish AXShowDefaultUI/AXShowAlternateUI and
+        // their labels publish AXShowMenu, so the app's primary navigation cannot
+        // be pressed through the action API at all.
+        let intents = [
+            ElementActionIntent(role: "AXButton", title: "About", action: .press),
+            ElementActionIntent(role: "AXButton", title: "Transfer or Reset", action: .press),
+            ElementActionIntent(role: "AXStaticText", title: "Accessibility", action: .press),
+            ElementActionIntent(role: "AXStaticText", title: "Privacy & Security", action: .press)
+        ]
 
-        var report: [String] = []
-        report.append(attempt(reachableIntent, expectingTitleToAppear: "Accessibility"))
-        report.append(attempt(unreachableIntent, expectingTitleToAppear: "Privacy & Security"))
+        // ONE observation, and every decision is made against it.
+        //
+        // The first version re-walked before each intent, which meant the press
+        // changed the window and the following intents were judged against a
+        // world that no longer contained them — "Transfer or Reset: NOT FOUND"
+        // was our own action erasing the evidence. A planner does not get to
+        // re-observe between deciding and acting, because acting is what moves
+        // the ground.
+        guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+              let rootNode = snapshot.rootNode else {
+            print("❌ could not read the focused window")
+            NSApplication.shared.terminate(nil)
+            return
+        }
 
-        let reportText = report.joined(separator: "\n\n")
-        print(reportText)
+        var report = ["window: \(snapshot.applicationName), \(snapshot.nodeCount) nodes", ""]
+        var approvedActions: [(ElementActionIntent, AccessibilityElementNode)] = []
+
+        for intent in intents {
+            switch ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode) {
+            case .notFound:
+                report.append("\(intent.title): NOT FOUND in the tree")
+            case .ambiguous(let count):
+                report.append("\(intent.title): REFUSED — \(count) elements match that name")
+            case .resolved(let node):
+                let decision = ActionSafetyKernel.evaluate(
+                    intent: intent,
+                    resolvedNode: node,
+                    matchCount: 1,
+                    visibleBounds: rootNode.frameInAppKitCoordinates
+                )
+                switch decision {
+                case .refuse(let reason):
+                    report.append("\(intent.title): REFUSED — \(reason)")
+                case .requireConfirmation(let reason):
+                    report.append("\(intent.title): WOULD ASK FIRST — \(reason)")
+                case .allow:
+                    report.append("\(intent.title): ALLOWED")
+                    approvedActions.append((intent, node))
+                }
+            }
+        }
+
+        report.append("")
+
+        // What the world looks like before we touch it.
+        let namesBefore = pressableElementNames(in: rootNode)
+
+        for (intent, node) in approvedActions {
+            guard let element = node.accessibilityElement else {
+                report.append("\(intent.title): resolved node carries no live element")
+                continue
+            }
+
+            let performResult = AXUIElementPerformAction(
+                element,
+                intent.action.accessibilityActionName as CFString
+            )
+            guard performResult == .success else {
+                report.append("\(intent.title): PERFORM FAILED — AXError \(performResult.rawValue)")
+                continue
+            }
+
+            report.append(contentsOf: verifyWorldChanged(from: namesBefore, forIntent: intent))
+        }
+
+        let reportText = report.joined(separator: "\n")
+        print("\n" + reportText)
 
         let outputDirectory = URL(fileURLWithPath: "/private/tmp/jarvis-ax-action", isDirectory: true)
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -116,68 +168,53 @@ enum AccessibilityDumpRunner {
         NSApplication.shared.terminate(nil)
     }
 
-    private static func attempt(
-        _ intent: ElementActionIntent,
-        expectingTitleToAppear expectedTitle: String
-    ) -> String {
-        guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
-              let rootNode = snapshot.rootNode else {
-            return "\(intent.title): could not read the focused window"
-        }
-
-        let resolution = ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode)
-
-        let resolvedNode: AccessibilityElementNode
-        let matchCount: Int
-        switch resolution {
-        case .notFound:
-            return "\(intent.title): NOT FOUND in the tree"
-        case .ambiguous(let count):
-            return "\(intent.title): REFUSED — \(count) elements match that title"
-        case .resolved(let node):
-            resolvedNode = node
-            matchCount = 1
-        }
-
-        let decision = ActionSafetyKernel.evaluate(
-            intent: intent,
-            resolvedNode: resolvedNode,
-            matchCount: matchCount
+    /// The names of everything pressable in a tree — the fingerprint we diff to
+    /// decide whether an action did anything.
+    private static func pressableElementNames(in rootNode: AccessibilityElementNode) -> Set<String> {
+        Set(
+            rootNode.flattenedDescendants()
+                .filter { $0.isActionable && $0.publishedActionNames.contains(kAXPressAction) }
+                .compactMap(\.displayName)
         )
+    }
 
-        switch decision {
-        case .refuse(let reason):
-            return "\(intent.title): REFUSED — \(reason)"
-        case .requireConfirmation(let reason):
-            return "\(intent.title): WOULD ASK FIRST — \(reason)"
-        case .allow:
-            break
-        }
+    /// Re-walks until the set of pressable elements differs from before, or the
+    /// budget expires.
+    ///
+    /// The previous predicate asked whether a node's **title** matched. Zero nodes
+    /// in System Settings carry a title, so it could never be satisfied — the
+    /// press worked and the verifier reported failure. Comparing names via
+    /// displayName, and diffing the whole set rather than hunting one label, is
+    /// both correct here and app-agnostic: it asks "did the world move", which is
+    /// the question, instead of "is this specific string present", which is a
+    /// guess about the app.
+    private static func verifyWorldChanged(
+        from namesBefore: Set<String>,
+        forIntent intent: ElementActionIntent,
+        timeoutInSeconds: Double = 3.0
+    ) -> [String] {
+        let startedAt = Date()
 
-        guard let element = resolvedNode.accessibilityElement else {
-            return "\(intent.title): resolved node carries no live element"
-        }
-
-        let performResult = AXUIElementPerformAction(element, intent.action.accessibilityActionName as CFString)
-        guard performResult == .success else {
-            return "\(intent.title): PERFORM FAILED — AXError \(performResult.rawValue)"
-        }
-
-        let outcome = ActionVerifier.verify { snapshot in
-            guard let root = snapshot.rootNode else { return false }
-            return root.flattenedDescendants().contains { node in
-                node.title == expectedTitle && node.depth > 2
+        while Date().timeIntervalSince(startedAt) < timeoutInSeconds {
+            if let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+               let rootNode = snapshot.rootNode {
+                let namesAfter = pressableElementNames(in: rootNode)
+                if namesAfter != namesBefore {
+                    let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+                    let appeared = namesAfter.subtracting(namesBefore).sorted()
+                    let disappeared = namesBefore.subtracting(namesAfter).sorted()
+                    return [
+                        "\(intent.title): PERFORMED and VERIFIED after \(elapsed) ms",
+                        "  appeared:    \(appeared.isEmpty ? "(none)" : appeared.joined(separator: ", "))",
+                        "  disappeared: \(disappeared.isEmpty ? "(none)" : disappeared.joined(separator: ", "))"
+                    ]
+                }
             }
+            Thread.sleep(forTimeInterval: 0.15)
         }
 
-        switch outcome {
-        case .confirmed(let milliseconds):
-            return "\(intent.title): PERFORMED and VERIFIED after \(milliseconds) ms"
-        case .notObserved(let milliseconds):
-            return "\(intent.title): PERFORMED but NOT VERIFIED after \(milliseconds) ms — treat as failure"
-        case .couldNotReadWindow:
-            return "\(intent.title): PERFORMED but the window could not be re-read"
-        }
+        let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+        return ["\(intent.title): PERFORMED but the tree did not change after \(elapsed) ms — treat as failure"]
     }
 
     private static func writeArtefacts(for snapshot: AccessibilityWindowSnapshot) async throws {
@@ -378,14 +415,29 @@ enum AccessibilityDumpRunner {
         for rootNode: AccessibilityElementNode,
         seconds: Double
     ) async {
-        guard let screen = NSScreen.main else { return }
+        // Only elements with real geometry. A zero-area frame would draw an
+        // invisible box at the corner of the display and tell you nothing.
+        let drawableNodes = rootNode.flattenedDescendants().filter {
+            $0.frameInAppKitCoordinates.width > 0 && $0.frameInAppKitCoordinates.height > 0
+        }
+        guard !drawableNodes.isEmpty else {
+            print("⚠️  overlay: no element has a non-zero frame")
+            return
+        }
 
-        let boxesView = AccessibilityElementBoxesView(
-            elementNodes: rootNode.flattenedDescendants().filter {
-                $0.frameInAppKitCoordinates.width > 0 && $0.frameInAppKitCoordinates.height > 0
-            },
-            screenFrame: screen.frame
-        )
+        // NSScreen.main is "the screen with the key window". This app is
+        // LSUIElement and non-activating, so it often has no key window and
+        // .main comes back nil or points at the wrong display — which silently
+        // skipped the whole overlay. Pick the screen the inspected window is
+        // actually on, and say so if we cannot.
+        let windowFrame = rootNode.frameInAppKitCoordinates
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(windowFrame) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else {
+            print("⚠️  overlay: no screen available")
+            return
+        }
 
         let panel = NSPanel(
             contentRect: screen.frame,
@@ -397,15 +449,157 @@ enum AccessibilityDumpRunner {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
-        panel.contentView = NSHostingView(rootView: boxesView)
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.contentView = NSHostingView(
+            rootView: AccessibilityElementBoxesView(
+                elementNodes: drawableNodes,
+                screenFrame: screen.frame
+            )
+        )
         panel.orderFrontRegardless()
+
+        // Held in a static: a local NSPanel is not retained by AppKit's window
+        // list, so it could be deallocated while still ordered in.
         surveyFlashPanel = panel
+
+        print("🟦 overlay: \(drawableNodes.count) boxes on \(Int(screen.frame.width))x\(Int(screen.frame.height)) for \(Int(seconds))s")
 
         try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
 
         panel.orderOut(nil)
         surveyFlashPanel = nil
+    }
+
+    /// Asks one question about whatever window is focused, and presses nothing:
+    /// **of everything on this screen that can be pressed, how much of it can the
+    /// runtime actually name, judge and target?**
+    ///
+    /// The core of it is a round trip. For each pressable element we take the name
+    /// the app gave it, feed that name back through the resolver, and check we get
+    /// the same element back. A name that resolves to two elements cannot be
+    /// targeted; an element with no name cannot be spoken about at all.
+    ///
+    /// Safe to run on any app: it performs no action.
+    static func runProbe() async {
+        for remainingSeconds in stride(from: 5, through: 1, by: -1) {
+            print("🧪 J.A.R.V.I.S.: focus the window to audit — \(remainingSeconds)")
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+
+        guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+              let rootNode = snapshot.rootNode else {
+            print("❌ could not read the focused window")
+            NSApplication.shared.terminate(nil)
+            return
+        }
+
+        let allNodes = rootNode.flattenedDescendants()
+        let pressableNodes = allNodes.filter { $0.publishedActionNames.contains(kAXPressAction) }
+
+        var unnamed = 0
+        var ambiguous = 0
+        var allowed = 0
+        var needsConfirmation = 0
+        var needsScrollFirst = 0
+        var refusalsByReason: [String: Int] = [:]
+        var ambiguousNames: Set<String> = []
+
+        for node in pressableNodes {
+            guard let name = node.displayName else {
+                unnamed += 1
+                continue
+            }
+
+            let intent = ElementActionIntent(role: node.role, title: name, action: .press)
+            let matchCount: Int
+            switch ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode) {
+            case .resolved:
+                matchCount = 1
+            case .ambiguous(let count):
+                matchCount = count
+                ambiguous += 1
+                ambiguousNames.insert(name)
+            case .notFound:
+                matchCount = 0
+            }
+
+            switch ActionSafetyKernel.evaluate(
+                intent: intent,
+                resolvedNode: node,
+                matchCount: matchCount,
+                visibleBounds: rootNode.frameInAppKitCoordinates
+            ) {
+            case .allow:
+                allowed += 1
+            case .requireConfirmation:
+                needsConfirmation += 1
+            case .refuse(let reason):
+                // An element with a real frame that sits outside the viewport is
+                // not unreachable — it is unreachable *yet*. GitHub put 79 of 118
+                // pressable elements below the fold; counting those as failures
+                // hides that "cannot act" and "cannot act yet" need completely
+                // different responses.
+                if reason == ActionSafetyKernel.outsideBoundsRefusalReason {
+                    needsScrollFirst += 1
+                } else {
+                    let key = reason.contains("match that") ? "name is not unique" : reason
+                    refusalsByReason[key, default: 0] += 1
+                }
+            }
+        }
+
+        let pressableCount = pressableNodes.count
+        let targetable = allowed + needsConfirmation
+        let percentage = pressableCount == 0 ? 0 : Int(Double(targetable) / Double(pressableCount) * 100)
+        let reachablePercentage = pressableCount == 0
+            ? 0
+            : Int(Double(targetable + needsScrollFirst) / Double(pressableCount) * 100)
+
+        var report: [String] = []
+        report.append("window: \(snapshot.applicationName) (\(snapshot.bundleIdentifier))")
+        report.append("nodes: \(snapshot.nodeCount)   actionable: \(allNodes.filter(\.isActionable).count)   pressable: \(pressableCount)")
+        report.append("")
+        report.append("NAMING — can the runtime say which element it means?")
+        report.append("  named and unique       \(pressableCount - unnamed - ambiguous)")
+        report.append("  name shared by others  \(ambiguous)")
+        if !ambiguousNames.isEmpty {
+            report.append("      e.g. \(ambiguousNames.sorted().prefix(4).joined(separator: ", "))")
+        }
+        report.append("  no name at all         \(unnamed)")
+        report.append("")
+        report.append("SAFETY KERNEL — dry run, nothing was pressed")
+        report.append("  allow                  \(allowed)")
+        report.append("  requireConfirmation    \(needsConfirmation)")
+        for (reason, count) in refusalsByReason.sorted(by: { $0.value > $1.value }) {
+            report.append("  refuse: \(reason)  \(count)")
+        }
+        report.append("")
+        report.append("REACHABILITY")
+        report.append("  actionable now         \(targetable)")
+        report.append("  needs a scroll first   \(needsScrollFirst)   (real frame, outside the viewport)")
+        report.append("  not addressable        \(pressableCount - targetable - needsScrollFirst)   (no name, ambiguous, or zero-area)")
+        report.append("")
+        report.append("READINESS  \(targetable) of \(pressableCount) pressable elements (\(percentage)%) actionable right now")
+        report.append("           \(targetable + needsScrollFirst) of \(pressableCount) (\(reachablePercentage)%) once scrolling is a verb the runtime has")
+
+        if snapshot.focusChangedDuringWalk {
+            report.append("⚠️  focus changed during the walk — these numbers describe a moving target")
+        }
+
+        let reportText = report.joined(separator: "\n")
+        print("\n" + reportText)
+
+        let outputDirectory = URL(fileURLWithPath: "/private/tmp/jarvis-ax-action", isDirectory: true)
+        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let fileName = "probe-\(snapshot.applicationName.replacingOccurrences(of: " ", with: "-")).txt"
+        try? reportText.write(to: outputDirectory.appendingPathComponent(fileName), atomically: true, encoding: .utf8)
+
+        // Draw what it just judged, so the screen and the numbers can be compared.
+        if CommandLine.arguments.contains("--ax-overlay") {
+            await flashElementBoxes(for: rootNode, seconds: 12)
+        }
+
+        NSApplication.shared.terminate(nil)
     }
 
 }

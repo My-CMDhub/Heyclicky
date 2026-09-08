@@ -40,6 +40,11 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if CommandLine.arguments.contains("--ax-probe") {
+            Task { await AccessibilityDumpRunner.runProbe() }
+            return
+        }
+
         if CommandLine.arguments.contains("--ax-survey") {
             Task { await AccessibilityDumpRunner.runSurvey() }
             return
