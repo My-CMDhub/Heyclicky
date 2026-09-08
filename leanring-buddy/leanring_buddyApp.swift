@@ -40,8 +40,18 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if CommandLine.arguments.contains("--ax-survey") {
+            Task { await AccessibilityDumpRunner.runSurvey() }
+            return
+        }
+
         if CommandLine.arguments.contains("--ax-dump") {
             Task { await AccessibilityDumpRunner.run() }
+            return
+        }
+
+        if CommandLine.arguments.contains("--ax-action") {
+            Task { await AccessibilityDumpRunner.runAction() }
             return
         }
 
