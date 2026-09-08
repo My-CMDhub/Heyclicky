@@ -81,6 +81,10 @@
          </CommandLineArgument>
          <CommandLineArgument
             argument = "--ax-probe"
+            isEnabled = "NO">
+         </CommandLineArgument>
+         <CommandLineArgument
+            argument = "--ax-task"
             isEnabled = "YES">
          </CommandLineArgument>
          <CommandLineArgument
@@ -97,7 +101,7 @@
          </CommandLineArgument>
          <CommandLineArgument
             argument = "--ax-overlay"
-            isEnabled = "YES">
+            isEnabled = "NO">
          </CommandLineArgument>
       </CommandLineArguments>
    </LaunchAction>

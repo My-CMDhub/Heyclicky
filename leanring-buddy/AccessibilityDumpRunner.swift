@@ -142,10 +142,10 @@ enum AccessibilityDumpRunner {
                 continue
             }
 
-            let performResult = AXUIElementPerformAction(
-                element,
-                intent.action.accessibilityActionName as CFString
-            )
+            let performResult = AccessibilityActionPerformer.perform(
+                intent.action.accessibilityActionName,
+                on: element
+            ).error
             guard performResult == .success else {
                 report.append("\(intent.title): PERFORM FAILED — AXError \(performResult.rawValue)")
                 continue
@@ -600,6 +600,354 @@ enum AccessibilityDumpRunner {
         }
 
         NSApplication.shared.terminate(nil)
+    }
+
+    // MARK: - Phase 3: a two-step workflow that survives a wait
+
+    /// Presses a target, waits for the app to settle, then presses a target that
+    /// **only exists after the first press**. The second step is the whole point:
+    /// anything that can be resolved before acting is a one-step task in disguise.
+    ///
+    /// The intents are hardcoded, exactly as Phase 2's were. There is no planner
+    /// and no model in this loop.
+    static func runTask() async {
+        for remainingSeconds in stride(from: 5, through: 1, by: -1) {
+            print("🧪 J.A.R.V.I.S.: focus System Settings (General pane) — \(remainingSeconds)")
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+
+        // Step one is measured, not guessed: --ax-probe confirmed on 2026-09-08
+        // that System Settings publishes AXPress on this AXButton and that
+        // pressing it navigates. Step two is a guess about what lives inside
+        // General > About, which this run exists to correct — which is why the
+        // appeared-set is printed whether or not it resolves.
+        let stepOneIntent = ElementActionIntent(role: "AXButton", title: "About", action: .press)
+        // Measured, no longer a guess: the 2026-09-08 run showed step one
+        // produces exactly four pressable buttons — Details…, Display Settings…,
+        // Storage Settings…, System Report…. This one navigates *within*
+        // System Settings; System Report… launches System Information and would
+        // move the focused window out from under the verifier.
+        let stepTwoIntent = ElementActionIntent(role: "AXButton", title: "Storage Settings…", action: .press)
+
+        guard let processIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+            print("❌ no frontmost application")
+            NSApplication.shared.terminate(nil)
+            return
+        }
+
+        guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+              let rootNode = snapshot.rootNode else {
+            print("❌ could not read the focused window")
+            NSApplication.shared.terminate(nil)
+            return
+        }
+
+        var report: [String] = []
+        report.append("window: \(snapshot.applicationName) (\(snapshot.bundleIdentifier)), \(snapshot.nodeCount) nodes, walk \(String(format: "%.1f", snapshot.walkDurationInSeconds * 1000)) ms")
+
+        let namesBeforeStepOne = pressableElementNames(in: rootNode)
+        report.append("")
+        report.append("PRESSABLE BEFORE STEP ONE (\(namesBeforeStepOne.count))")
+        report.append("  " + (namesBeforeStepOne.sorted().joined(separator: ", ")))
+
+        // ---- Step one -------------------------------------------------------
+        report.append("")
+        report.append("STEP ONE — press \"\(stepOneIntent.title)\"")
+        var stepOnePerformed = false
+        let firstSettleStartedAt = Date()
+        let firstSettleReport = WindowSettleObserver.waitForSettle(
+            processIdentifier: processIdentifier,
+            performWhileArmed: {
+                stepOnePerformed = performIfAllowed(
+                    stepOneIntent, inTreeRootedAt: rootNode, into: &report
+                )
+            },
+            pollFallback: { pollForChange(from: namesBeforeStepOne) }
+        )
+        guard stepOnePerformed else {
+            finishTask(report, terminate: true)
+            return
+        }
+        let firstSettleWallClockMilliseconds = Int(Date().timeIntervalSince(firstSettleStartedAt) * 1000)
+
+        // ---- Re-observe ONCE ------------------------------------------------
+        guard let afterSnapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+              let afterRootNode = afterSnapshot.rootNode else {
+            report.append("❌ could not re-read the window after step one")
+            finishTask(report, terminate: true)
+            return
+        }
+
+        let namesAfterStepOne = pressableElementNames(in: afterRootNode)
+        let appeared = namesAfterStepOne.subtracting(namesBeforeStepOne).sorted()
+        let disappeared = namesBeforeStepOne.subtracting(namesAfterStepOne).sorted()
+
+        report.append("")
+        report.append("WHAT STEP ONE PRODUCED  (re-walk cost \(String(format: "%.1f", afterSnapshot.walkDurationInSeconds * 1000)) ms)")
+        report.append("  appeared (\(appeared.count)):    \(appeared.isEmpty ? "(none)" : appeared.joined(separator: ", "))")
+        report.append("  disappeared (\(disappeared.count)): \(disappeared.isEmpty ? "(none)" : disappeared.joined(separator: ", "))")
+        if appeared.isEmpty && disappeared.isEmpty {
+            report.append("  ⚠️  the pressable set is identical — step one changed nothing we can see")
+        }
+
+        // ---- Step two -------------------------------------------------------
+        report.append("")
+        report.append("STEP TWO — press \"\(stepTwoIntent.title)\" (exists only after step one)")
+
+        // Phase 4: the kernel's "outside the visible bounds" refusal is the one
+        // refusal with an answer — the element is real, named and pressable, it
+        // is merely scrolled away. Compared against the CONSTANT, never a
+        // retyped sentence: a typo here would silently scroll on a destructive
+        // confirmation instead.
+        var treeForStepTwo = afterRootNode
+        var namesBeforeStepTwo = namesAfterStepOne
+
+        let precheck = kernelDecision(stepTwoIntent, inTreeRootedAt: treeForStepTwo)
+        if case .refuse(let reason) = precheck.decision,
+           reason == ActionSafetyKernel.outsideBoundsRefusalReason,
+           let unreachableNode = precheck.node {
+            report.append("  REFUSED — \(reason)")
+            report.append("  → answering the refusal: page its scrolling ancestor")
+
+            let attempt = ElementReachability.makeReachable(
+                node: unreachableNode,
+                within: treeForStepTwo,
+                visibleBounds: treeForStepTwo.frameInAppKitCoordinates,
+                processIdentifier: processIdentifier
+            )
+            report.append(contentsOf: describe(attempt))
+
+            // Re-evaluate FROM SCRATCH on a fresh tree. Scrolling changed one
+            // input to the kernel; it granted no permission.
+            if let scrolledRootNode = attempt.finalRootNode {
+                treeForStepTwo = scrolledRootNode
+                namesBeforeStepTwo = pressableElementNames(in: scrolledRootNode)
+            }
+            let recheck = kernelDecision(stepTwoIntent, inTreeRootedAt: treeForStepTwo)
+            report.append("  KERNEL RE-EVALUATION (fresh tree, fresh resolve)")
+            report.append("    \(describe(recheck.decision))")
+        }
+
+        var secondSettleReport: SettleReport?
+        var secondSettleWallClockMilliseconds = 0
+
+        var stepTwoPerformed = false
+        let secondSettleStartedAt = Date()
+        let secondReport = WindowSettleObserver.waitForSettle(
+            processIdentifier: processIdentifier,
+            performWhileArmed: {
+                stepTwoPerformed = performIfAllowed(
+                    stepTwoIntent, inTreeRootedAt: treeForStepTwo, into: &report
+                )
+            },
+            pollFallback: { pollForChange(from: namesBeforeStepTwo) }
+        )
+
+        if stepTwoPerformed {
+            secondSettleReport = secondReport
+            secondSettleWallClockMilliseconds = Int(Date().timeIntervalSince(secondSettleStartedAt) * 1000)
+
+            if let finalSnapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+               let finalRootNode = finalSnapshot.rootNode {
+                // Diffed against the tree step two actually acted on, which is
+                // the post-scroll one when a scroll happened. Diffing against
+                // the pre-scroll set would credit the scroll's own changes to
+                // the press.
+                let namesAfterStepTwo = pressableElementNames(in: finalRootNode)
+                let appearedTwo = namesAfterStepTwo.subtracting(namesBeforeStepTwo).sorted()
+                let disappearedTwo = namesBeforeStepTwo.subtracting(namesAfterStepTwo).sorted()
+                if namesAfterStepTwo == namesBeforeStepTwo {
+                    report.append("  VERIFY: the pressable set did not change — treat step two as FAILED")
+                } else {
+                    report.append("  VERIFY: confirmed, the tree moved")
+                    report.append("    appeared:    \(appearedTwo.isEmpty ? "(none)" : appearedTwo.joined(separator: ", "))")
+                    report.append("    disappeared: \(disappearedTwo.isEmpty ? "(none)" : disappearedTwo.joined(separator: ", "))")
+                }
+            } else {
+                report.append("  VERIFY: could not re-read the window")
+            }
+        } else {
+            report.append("  → nothing was pressed. The appeared-set above is what step two should have named.")
+        }
+
+        // ---- The number this phase must produce ------------------------------
+        report.append("")
+        report.append("SETTLE REPORT — step one")
+        report.append(contentsOf: describe(firstSettleReport, wallClockMilliseconds: firstSettleWallClockMilliseconds))
+
+        if let secondSettleReport {
+            report.append("")
+            report.append("SETTLE REPORT — step two")
+            report.append(contentsOf: describe(secondSettleReport, wallClockMilliseconds: secondSettleWallClockMilliseconds))
+        }
+
+        report.append("")
+        report.append("WAITING, THREE WAYS (step one)")
+        report.append("  fixed sleep(1.0)       1000 ms, 0 walks, correctness unknown — it is a guess")
+        report.append("  AXObserver + debounce  \(firstSettleWallClockMilliseconds) ms, \(firstSettleReport.pollCount) walks, settled=\(firstSettleReport.settled)")
+
+        finishTask(report, terminate: true)
+    }
+
+    /// Resolve → safety kernel, with no side effect on the machine.
+    ///
+    /// Split out of `performIfAllowed` so a caller can inspect *why* the kernel
+    /// refused before deciding whether that refusal has an answer — a scroll
+    /// answers "outside the visible bounds" and nothing else.
+    private static func kernelDecision(
+        _ intent: ElementActionIntent,
+        inTreeRootedAt rootNode: AccessibilityElementNode
+    ) -> (decision: SafetyDecision, node: AccessibilityElementNode?) {
+        switch ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode) {
+        case .notFound:
+            return (.refuse(reason: "not found in the tree"), nil)
+        case .ambiguous(let count):
+            return (.refuse(reason: "\(count) elements match that name"), nil)
+        case .resolved(let resolvedNode):
+            return (
+                ActionSafetyKernel.evaluate(
+                    intent: intent,
+                    resolvedNode: resolvedNode,
+                    matchCount: 1,
+                    visibleBounds: rootNode.frameInAppKitCoordinates
+                ),
+                resolvedNode
+            )
+        }
+    }
+
+    /// Resolve → safety kernel → perform, in that order, appending the reasoning.
+    /// Returns whether the action actually reached the machine.
+    private static func performIfAllowed(
+        _ intent: ElementActionIntent,
+        inTreeRootedAt rootNode: AccessibilityElementNode,
+        into report: inout [String]
+    ) -> Bool {
+        let evaluation = kernelDecision(intent, inTreeRootedAt: rootNode)
+        switch evaluation.decision {
+        case .refuse(let reason):
+            report.append("  \(intent.title): REFUSED — \(reason)")
+            return false
+        case .requireConfirmation(let reason):
+            report.append("  \(intent.title): WOULD ASK FIRST — \(reason)")
+            return false
+        case .allow:
+            break
+        }
+
+        guard let element = evaluation.node?.accessibilityElement else {
+            report.append("  \(intent.title): resolved node carries no live element")
+            return false
+        }
+
+        let performResult = AccessibilityActionPerformer.perform(
+            intent.action.accessibilityActionName,
+            on: element
+        ).error
+        guard performResult == .success else {
+            report.append("  \(intent.title): PERFORM FAILED — AXError \(performResult.rawValue)")
+            return false
+        }
+
+        report.append("  \(intent.title): ALLOWED and PERFORMED")
+        return true
+    }
+
+    /// The poll path, unchanged, used only when the observer heard nothing.
+    /// `expectation` runs once per walk, so counting calls counts walks.
+    private static func pollForChange(
+        from namesBefore: Set<String>,
+        timeoutInSeconds: Double = 3.0
+    ) -> (settled: Bool, pollCount: Int) {
+        var pollCount = 0
+        let outcome = ActionVerifier.verify(
+            expectation: { snapshot in
+                pollCount += 1
+                guard let rootNode = snapshot.rootNode else { return false }
+                return pressableElementNames(in: rootNode) != namesBefore
+            },
+            timeoutInSeconds: timeoutInSeconds
+        )
+
+        if case .confirmed = outcome {
+            return (true, pollCount)
+        }
+        return (false, pollCount)
+    }
+
+    private static func describe(_ decision: SafetyDecision) -> String {
+        switch decision {
+        case .allow:
+            return "ALLOW"
+        case .requireConfirmation(let reason):
+            return "WOULD ASK FIRST — \(reason)"
+        case .refuse(let reason):
+            return "REFUSED — \(reason)"
+        }
+    }
+
+    private static func rectangleText(_ rectangle: CGRect) -> String {
+        String(
+            format: "(%.0f, %.0f, %.0f, %.0f)",
+            rectangle.origin.x, rectangle.origin.y, rectangle.width, rectangle.height
+        )
+    }
+
+    private static func describe(_ attempt: ReachabilityAttempt) -> [String] {
+        var lines: [String] = []
+        lines.append("  SCROLL ATTEMPT")
+        lines.append("    scrollable ancestor  \(attempt.scrollContainerRole ?? "(none found)")\(attempt.scrollContainerName.map { " \"\($0)\"" } ?? "")")
+        lines.append("    container frame      \(attempt.scrollContainerFrame.map(rectangleText) ?? "(none)")")
+        lines.append("    visible bounds       \(rectangleText(attempt.visibleBoundsUsed))")
+        lines.append("    direction            \(attempt.direction?.accessibilityActionName ?? "(none — already visible)")")
+        lines.append("    pages spent          \(attempt.outcome.pagesSpent)")
+        lines.append("    target frame before  \(rectangleText(attempt.frameBefore))")
+        lines.append("    target frame after   \(rectangleText(attempt.frameAfter))")
+        lines.append("    scrolled by          \(attempt.usedSyntheticScroll ? "synthetic wheel event (AX verb failed)" : "AX action")")
+        lines.append("    outcome              \(attempt.outcome)")
+        for (index, settleReport) in attempt.settleReports.enumerated() {
+            lines.append("    SETTLE — page \(index + 1)")
+            lines.append(contentsOf: describe(settleReport, wallClockMilliseconds: settleReport.millisecondsToQuiet)
+                .map { "  " + $0 })
+        }
+        return lines
+    }
+
+    private static func describe(
+        _ settleReport: SettleReport,
+        wallClockMilliseconds: Int
+    ) -> [String] {
+        var lines: [String] = []
+        lines.append("  settled                \(settleReport.settled) — \(settleReport.outcomeDescription)")
+        lines.append("  wall clock             \(wallClockMilliseconds) ms")
+        lines.append("  first notification     \(settleReport.millisecondsToFirstNotification.map { "\($0) ms" } ?? "(none arrived)")")
+        lines.append("  quiet at               \(settleReport.millisecondsToQuiet) ms")
+        lines.append("  notifications          \(settleReport.notificationCount)")
+        for (name, count) in settleReport.notificationsByName.sorted(by: { $0.value > $1.value }) {
+            lines.append("      \(name)  \(count)")
+        }
+        lines.append("  accepted by the app    \(settleReport.acceptedNotificationNames.isEmpty ? "(none)" : settleReport.acceptedNotificationNames.joined(separator: ", "))")
+        lines.append("  refused by the app     \(settleReport.refusedNotificationNames.isEmpty ? "(none)" : settleReport.refusedNotificationNames.joined(separator: ", "))")
+        lines.append("  fell back to polling   \(settleReport.fellBackToPolling)")
+        lines.append("  tree walks spent       \(settleReport.pollCount)")
+        return lines
+    }
+
+    private static func finishTask(_ report: [String], terminate: Bool) {
+        let reportText = report.joined(separator: "\n")
+        print("\n" + reportText)
+
+        let outputDirectory = URL(fileURLWithPath: "/private/tmp/jarvis-ax-action", isDirectory: true)
+        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        try? reportText.write(
+            to: outputDirectory.appendingPathComponent("task.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        if terminate {
+            NSApplication.shared.terminate(nil)
+        }
     }
 
 }
