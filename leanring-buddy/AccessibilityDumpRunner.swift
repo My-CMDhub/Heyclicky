@@ -296,6 +296,7 @@ enum AccessibilityDumpRunner {
         estimated text tokens  \(estimatedTextTokens)
         nodes walked           \(snapshot.nodeCount)
         subtrees lost to error \(snapshot.subtreesLostToFailedReads)
+        skipped far off-screen \(snapshot.subtreesSkippedFarOffScreen) subtrees, \(snapshot.nodesSkippedFarOffScreen) direct children not walked
         focus changed mid-walk \(snapshot.focusChangedDuringWalk)
         ACTIONABLE elements    \(actionableElementCount)
 

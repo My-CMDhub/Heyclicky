@@ -125,6 +125,17 @@ struct AccessibilityWindowSnapshot {
     let nodesWithoutReadableFrame: Int
     let subtreesLostToFailedReads: Int
 
+    /// Subtrees we chose not to walk because their root sits far outside the
+    /// window, and how many nodes that saved.
+    ///
+    /// This is a deliberate omission, not a failure, so it is reported the same
+    /// way truncation is: a count, never a silent absence. Structure's whole
+    /// claim over vision is knowing what exists off-screen — so we still say
+    /// *that* something is there and how much of it, we just do not enumerate a
+    /// message list to find one button.
+    let subtreesSkippedFarOffScreen: Int
+    let nodesSkippedFarOffScreen: Int
+
     /// True when the frontmost application changed while the walk was running.
     ///
     /// Measured 2026-09-08: Mail took 27.1 seconds to walk. Anything that slow is
@@ -245,7 +256,7 @@ enum AccessibilityTreeWalker {
     /// ever needs to walk while the UI stays responsive.
     static func snapshotFocusedWindow(
         maximumDepth: Int = 120,
-        maximumNodeCount: Int = 2000
+        maximumNodeCount: Int = 25_000
     ) throws -> AccessibilityWindowSnapshot {
         guard AXIsProcessTrusted() else {
             throw AccessibilitySnapshotError.accessibilityPermissionNotGranted
@@ -342,6 +353,29 @@ enum AccessibilityTreeWalker {
         var timedOutNodePaths: [String] = []
         var nodesWithoutReadableFrame = 0
         var subtreesLostToFailedReads = 0
+        var subtreesSkippedFarOffScreen = 0
+        var nodesSkippedFarOffScreen = 0
+
+        // How far off-screen still counts as reachable.
+        //
+        // Measured 2026-09-09: Mail's window shows 122 elements while the tree
+        // holds 4,000 — 424 subtrees are rooted outside the window, carrying
+        // 3,454 descendants. Those are message-list rows, an index rather than a
+        // set of targets. But "Storage Settings…" sat 130 points below the fold
+        // and WAS a target, so the boundary cannot be the window edge itself.
+        // One window-height of margin on every side keeps anything a scroll or
+        // two away inside the tree by construction rather than by luck.
+        var windowFrameValue: CFTypeRef?
+        AXUIElementCopyAttributeValue(focusedWindowElement, "AXFrame" as CFString, &windowFrameValue)
+        var windowRect = CGRect.zero
+        if let windowFrameValue, CFGetTypeID(windowFrameValue) == AXValueGetTypeID() {
+            AXValueGetValue(windowFrameValue as! AXValue, .cgRect, &windowRect)
+        }
+        let reachableArea: CGRect? = windowRect.isEmpty
+            ? nil
+            : convertAccessibilityFrameToAppKitFrame(
+                windowRect, primaryDisplayHeightInPoints: primaryDisplayHeightInPoints
+              ).insetBy(dx: -windowRect.width, dy: -windowRect.height)
 
         let walkStartedAt = Date()
         let rootNode = buildNode(
@@ -352,7 +386,10 @@ enum AccessibilityTreeWalker {
             deepestLevelReached: &deepestLevelReached,
             timedOutNodePaths: &timedOutNodePaths,
             nodesWithoutReadableFrame: &nodesWithoutReadableFrame,
-            subtreesLostToFailedReads: &subtreesLostToFailedReads
+            subtreesLostToFailedReads: &subtreesLostToFailedReads,
+            reachableArea: reachableArea,
+            subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
+            nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen
         )
         let walkDurationInSeconds = Date().timeIntervalSince(walkStartedAt)
 
@@ -373,6 +410,8 @@ enum AccessibilityTreeWalker {
             timedOutNodePaths: timedOutNodePaths,
             nodesWithoutReadableFrame: nodesWithoutReadableFrame,
             subtreesLostToFailedReads: subtreesLostToFailedReads,
+            subtreesSkippedFarOffScreen: subtreesSkippedFarOffScreen,
+            nodesSkippedFarOffScreen: nodesSkippedFarOffScreen,
             focusChangedDuringWalk: focusChangedDuringWalk
         )
     }
@@ -477,7 +516,10 @@ enum AccessibilityTreeWalker {
         deepestLevelReached: inout Int,
         timedOutNodePaths: inout [String],
         nodesWithoutReadableFrame: inout Int,
-        subtreesLostToFailedReads: inout Int
+        subtreesLostToFailedReads: inout Int,
+        reachableArea: CGRect?,
+        subtreesSkippedFarOffScreen: inout Int,
+        nodesSkippedFarOffScreen: inout Int
     ) -> AccessibilityElementNode? {
         guard budget.claimSlot(atDepth: depth) else { return nil }
 
@@ -525,7 +567,21 @@ enum AccessibilityTreeWalker {
             subtreesLostToFailedReads += 1
         }
 
-        for childElement in childReadResult.children {
+        // Stop descending when this node sits far outside the window. A
+        // zero-area frame is NOT "outside" — it is the meaningless-value case,
+        // and its children may still be real, so it is excluded from this test.
+        let isFarOffScreen: Bool = {
+            guard let reachableArea, depth > 0,
+                  appKitFrame.width > 0, appKitFrame.height > 0 else { return false }
+            return !appKitFrame.intersects(reachableArea)
+        }()
+
+        if isFarOffScreen, !childReadResult.children.isEmpty {
+            subtreesSkippedFarOffScreen += 1
+            nodesSkippedFarOffScreen += childReadResult.children.count
+        }
+
+        for childElement in isFarOffScreen ? [] : childReadResult.children {
             guard let childNode = buildNode(
                 from: childElement,
                 depth: depth + 1,
@@ -534,7 +590,10 @@ enum AccessibilityTreeWalker {
                 deepestLevelReached: &deepestLevelReached,
                 timedOutNodePaths: &timedOutNodePaths,
                 nodesWithoutReadableFrame: &nodesWithoutReadableFrame,
-                subtreesLostToFailedReads: &subtreesLostToFailedReads
+                subtreesLostToFailedReads: &subtreesLostToFailedReads,
+                reachableArea: reachableArea,
+                subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
+                nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen
             ) else { break }
 
             childNodes.append(childNode)
