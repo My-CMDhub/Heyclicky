@@ -83,27 +83,60 @@ struct AccessibilityElementNode {
 ///
 /// A truncated tree is indistinguishable from a genuinely shallow app, so a
 /// silent cap would quietly teach us the wrong lesson about how AX behaves.
+/// Why a walk stopped early. Three unrelated causes that a single `truncated`
+/// flag would flatten into one useless bit — and the project has already paid
+/// once for a boolean sitting next to a number it invalidated.
+enum WalkStopReason: String, CaseIterable {
+    case depthLimit = "hit the depth limit"
+    case nodeLimit = "hit the node limit"
+    case timeLimit = "ran out of time"
+}
+
 struct AccessibilityWalkBudget {
     let maximumDepth: Int
     let maximumNodeCount: Int
 
-    private(set) var nodesVisited = 0
-    private(set) var wasTruncated = false
+    /// The wall-clock guard, and the only one that protects against an app we do
+    /// not control.
+    ///
+    /// Depth and node caps bound the *shape* of a tree; neither bounds a walk
+    /// against a stalled or hostile app, where a single read can block for the
+    /// full messaging timeout. Measured 2026-09-09: Mail walked 18,538 nodes in
+    /// 5.1 s at 0.275 ms/node, but its cold per-node cost was 11.22 ms — the same
+    /// tree at that rate would take over three minutes. Nothing in the node cap
+    /// would have stopped it.
+    let deadline: Date
 
-    init(maximumDepth: Int, maximumNodeCount: Int) {
+    private(set) var nodesVisited = 0
+    private(set) var stopReasons: Set<WalkStopReason> = []
+
+    /// Kept so callers that only ask "was this complete?" still work. Anything
+    /// reporting the result should print `stopReasons` instead — "it stopped" and
+    /// "it stopped because the app went unresponsive" are different facts.
+    var wasTruncated: Bool { !stopReasons.isEmpty }
+
+    init(maximumDepth: Int, maximumNodeCount: Int, timeLimitInSeconds: Double = 10.0) {
         self.maximumDepth = maximumDepth
         self.maximumNodeCount = maximumNodeCount
+        self.deadline = Date().addingTimeInterval(timeLimitInSeconds)
     }
 
     /// Returns true if a node at this depth may be visited, spending one slot.
-    /// Returns false and flags truncation when either limit is reached.
+    /// Returns false and records *which* limit stopped it.
     mutating func claimSlot(atDepth depth: Int) -> Bool {
         guard depth < maximumDepth else {
-            wasTruncated = true
+            stopReasons.insert(.depthLimit)
             return false
         }
         guard nodesVisited < maximumNodeCount else {
-            wasTruncated = true
+            stopReasons.insert(.nodeLimit)
+            return false
+        }
+        // Checked per node rather than per subtree: a walk that blows its budget
+        // does so inside one slow read, and a coarser check would sail past the
+        // deadline by exactly the amount we are trying to bound.
+        guard Date() < deadline else {
+            stopReasons.insert(.timeLimit)
             return false
         }
 
@@ -121,6 +154,9 @@ struct AccessibilityWindowSnapshot {
     let nodeCount: Int
     let deepestLevelReached: Int
     let wasTruncatedByBudget: Bool
+
+    /// Which limits stopped the walk. Empty means it finished.
+    let walkStopReasons: Set<WalkStopReason>
     let timedOutNodePaths: [String]
     let nodesWithoutReadableFrame: Int
     let subtreesLostToFailedReads: Int
@@ -407,6 +443,7 @@ enum AccessibilityTreeWalker {
             nodeCount: budget.nodesVisited,
             deepestLevelReached: deepestLevelReached,
             wasTruncatedByBudget: budget.wasTruncated,
+            walkStopReasons: budget.stopReasons,
             timedOutNodePaths: timedOutNodePaths,
             nodesWithoutReadableFrame: nodesWithoutReadableFrame,
             subtreesLostToFailedReads: subtreesLostToFailedReads,

@@ -276,7 +276,7 @@ enum AccessibilityDumpRunner {
             ? """
               ⚠️  TRUNCATED — every count below is a floor, not a measurement.
                   The walk stopped at depth \(snapshot.deepestLevelReached) / \(snapshot.nodeCount) nodes
-                  because it hit OUR budget, not the end of the app's tree.
+                  because it \(snapshot.walkStopReasons.map(\.rawValue).sorted().joined(separator: " and ")) — OUR limit, not the end of the app's tree.
                   Do not compare this app to an untruncated one.
 
               """

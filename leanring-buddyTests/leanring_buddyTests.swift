@@ -445,3 +445,49 @@ struct leanring_buddyTests {
     }
 
 }
+
+// MARK: - Wall-clock guard
+
+@Test func budgetStopsWhenItRunsOutOfTime() async throws {
+    // The node and depth caps bound a tree's shape. Neither bounds a walk against
+    // an app that has stopped answering, where one read can block for the whole
+    // messaging timeout. This is the only limit that does.
+    var budget = AccessibilityWalkBudget(
+        maximumDepth: 1000, maximumNodeCount: 1_000_000, timeLimitInSeconds: 0.05
+    )
+    let firstClaim = budget.claimSlot(atDepth: 0)
+    #expect(firstClaim)
+
+    Thread.sleep(forTimeInterval: 0.08)
+
+    let claimAfterDeadline = budget.claimSlot(atDepth: 0)
+    #expect(claimAfterDeadline == false)
+
+    let reasons = budget.stopReasons
+    #expect(reasons == [.timeLimit])
+}
+
+@Test func budgetNamesWhichLimitStoppedIt() async throws {
+    // "It stopped" and "it stopped because the app went unresponsive" are
+    // different facts. A single boolean flattens them, and this project has
+    // already spent a day reading a truncated count as a measurement.
+    var depthBudget = AccessibilityWalkBudget(maximumDepth: 2, maximumNodeCount: 100)
+    _ = depthBudget.claimSlot(atDepth: 5)
+    let depthReasons = depthBudget.stopReasons
+    #expect(depthReasons == [.depthLimit])
+
+    var nodeBudget = AccessibilityWalkBudget(maximumDepth: 100, maximumNodeCount: 1)
+    _ = nodeBudget.claimSlot(atDepth: 0)
+    _ = nodeBudget.claimSlot(atDepth: 0)
+    let nodeReasons = nodeBudget.stopReasons
+    #expect(nodeReasons == [.nodeLimit])
+}
+
+@Test func budgetThatFinishesReportsNoReason() async throws {
+    var budget = AccessibilityWalkBudget(maximumDepth: 10, maximumNodeCount: 10)
+    let claimed = budget.claimSlot(atDepth: 0)
+    #expect(claimed)
+    let reasons = budget.stopReasons
+    #expect(reasons.isEmpty)
+    #expect(budget.wasTruncated == false)
+}
