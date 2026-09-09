@@ -14,6 +14,42 @@ import SwiftUI
 @MainActor
 enum AccessibilityDumpRunner {
 
+    /// A run that could not read anything must still leave a file behind.
+    ///
+    /// Measured 2026-09-10: with the machine locked, four dump runs in a row
+    /// printed to a console nobody was reading and wrote nothing at all, so the
+    /// harness saw an empty directory and the operator saw "no result" — which
+    /// looks exactly like a hang, a crash, or a stale binary. A refusal is a
+    /// result and has to be written down like one.
+    static func writeFailure(_ reason: String, to fileName: String = "metrics.txt") {
+        let text = "RUN FAILED — \(reason)\nnothing was measured; this file exists so the absence is not silent"
+        print("\n" + text)
+        for directory in ["/private/tmp/jarvis-ax-dump", "/private/tmp/jarvis-ax-action"] {
+            let url = URL(fileURLWithPath: directory, isDirectory: true)
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try? text.write(to: url.appendingPathComponent(fileName), atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Why the window could not be read, in words rather than a nil.
+    static func describeSnapshotFailure() -> String {
+        do {
+            _ = try AccessibilityTreeWalker.snapshotFocusedWindow()
+            return "the window read succeeded on retry — the first failure was transient"
+        } catch AccessibilitySnapshotError.screenIsLocked {
+            return "THE SCREEN IS LOCKED. Nothing here describes the user's world; unlock and rerun."
+        } catch AccessibilitySnapshotError.accessibilityPermissionNotGranted {
+            return "Accessibility permission is not granted to this build"
+        } catch AccessibilitySnapshotError.noFrontmostApplication {
+            return "no frontmost application"
+        } catch AccessibilitySnapshotError.noFocusedWindow {
+            return "the frontmost application has no focused window"
+        } catch {
+            return "\(error)"
+        }
+    }
+
+
     /// Held across samples so the flash panel is not deallocated mid-display.
     private static var surveyFlashPanel: NSPanel?
 
@@ -98,7 +134,7 @@ enum AccessibilityDumpRunner {
         // the ground.
         guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
               let rootNode = snapshot.rootNode else {
-            print("❌ could not read the focused window")
+            writeFailure(describeSnapshotFailure())
             NSApplication.shared.terminate(nil)
             return
         }
@@ -528,7 +564,7 @@ enum AccessibilityDumpRunner {
 
         guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
               let rootNode = snapshot.rootNode else {
-            print("❌ could not read the focused window")
+            writeFailure(describeSnapshotFailure())
             NSApplication.shared.terminate(nil)
             return
         }
@@ -743,7 +779,7 @@ enum AccessibilityDumpRunner {
 
         guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
               let rootNode = snapshot.rootNode else {
-            print("❌ could not read the focused window")
+            writeFailure(describeSnapshotFailure())
             NSApplication.shared.terminate(nil)
             return
         }
@@ -890,7 +926,7 @@ enum AccessibilityDumpRunner {
 
         guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
               let rootNode = snapshot.rootNode else {
-            print("❌ could not read the focused window")
+            writeFailure(describeSnapshotFailure())
             NSApplication.shared.terminate(nil)
             return
         }

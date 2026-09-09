@@ -773,3 +773,13 @@ private func windowContaining(_ children: [AccessibilityElementNode]) -> Accessi
 
     #expect(outcome == .noLiveElement)
 }
+
+@Test func aLockedScreenIsRefusedRatherThanMeasured() async throws {
+    // Measured 2026-09-10: with the machine locked, every walk returned 1 node,
+    // 0 actionable and a 0-byte screenshot, with no error — for three different
+    // apps in a row. A believable number describing the lock screen.
+    #expect(LockScreenGuard.isLockScreen("com.apple.loginwindow"))
+    #expect(LockScreenGuard.isLockScreen("com.apple.ScreenSaver.Engine"))
+    #expect(LockScreenGuard.isLockScreen("com.apple.finder") == false)
+    #expect(LockScreenGuard.isLockScreen(nil) == false)
+}

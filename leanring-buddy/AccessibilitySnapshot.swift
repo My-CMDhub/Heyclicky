@@ -121,11 +121,22 @@ struct AccessibilityWalkBudget {
     /// not control.
     ///
     /// Depth and node caps bound the *shape* of a tree; neither bounds a walk
-    /// against a stalled or hostile app, where a single read can block for the
-    /// full messaging timeout. Measured 2026-09-09: Mail walked 18,538 nodes in
-    /// 5.1 s at 0.275 ms/node, but its cold per-node cost was 11.22 ms — the same
-    /// tree at that rate would take over three minutes. Nothing in the node cap
-    /// would have stopped it.
+    /// against a slow app, where a single read can block for the full messaging
+    /// timeout.
+    ///
+    /// **Calibrated 2026-09-10**, having shipped as a guess. Every legitimate
+    /// walk measured that day, warm and cold:
+    ///
+    ///     Music 89.9 ms · Calendar 96.7 ms · Cursor 111.8 ms · Claude Desktop 123.1 ms
+    ///     System Settings ~360 ms · Finder 785.8 ms · Mail 1,798.6 ms
+    ///
+    /// Five seconds is 2.8x the slowest of those. The asymmetry decides it: too
+    /// long and a person waits at a blank screen, too short and the walk stops
+    /// and *says* `.timeLimit`, which is a visible instruction to raise it.
+    ///
+    /// It does **not** protect against an app that has stopped answering
+    /// entirely — measured the same day by SIGSTOPping an app, the pre-walk
+    /// reads fail on the messaging timeout and the walk never begins.
     let deadline: Date
 
     private(set) var nodesVisited = 0
@@ -136,7 +147,7 @@ struct AccessibilityWalkBudget {
     /// "it stopped because the app went unresponsive" are different facts.
     var wasTruncated: Bool { !stopReasons.isEmpty }
 
-    init(maximumDepth: Int, maximumNodeCount: Int, timeLimitInSeconds: Double = 10.0) {
+    init(maximumDepth: Int, maximumNodeCount: Int, timeLimitInSeconds: Double = 5.0) {
         self.maximumDepth = maximumDepth
         self.maximumNodeCount = maximumNodeCount
         self.deadline = Date().addingTimeInterval(timeLimitInSeconds)
@@ -226,6 +237,27 @@ enum AccessibilitySnapshotError: Error {
     case accessibilityPermissionNotGranted
     case noFrontmostApplication
     case noFocusedWindow
+
+    /// The screen is locked or the saver is up, so the frontmost application is
+    /// `loginwindow` and there is nothing of the user's world to read.
+    case screenIsLocked
+}
+
+/// Bundle identifiers that mean "there is no user session in front of you".
+///
+/// Measured 2026-09-10, and it cost four measurements in a row: the machine
+/// locked itself mid-session and every walk after that returned **1 node,
+/// 0 actionable, 42 bytes** with a **0-byte screenshot** and no error at all —
+/// for Photos, for Mail, for Finder. Plausible-looking rows in a table, all
+/// describing the lock screen. This is the fifth time this project has been
+/// handed a successful read of a world that was not there.
+enum LockScreenGuard {
+    static let bundleIdentifiers: Set<String> = ["com.apple.loginwindow", "com.apple.ScreenSaver.Engine"]
+
+    static func isLockScreen(_ bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier else { return false }
+        return bundleIdentifiers.contains(bundleIdentifier)
+    }
 }
 
 enum AccessibilityTreeWalker {
@@ -337,6 +369,12 @@ enum AccessibilityTreeWalker {
 
         guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else {
             throw AccessibilitySnapshotError.noFrontmostApplication
+        }
+
+        // Refuse rather than describe the lock screen. A 1-node tree is a
+        // believable number, and believable is exactly the problem.
+        guard !LockScreenGuard.isLockScreen(frontmostApplication.bundleIdentifier) else {
+            throw AccessibilitySnapshotError.screenIsLocked
         }
 
         // Setting the timeout on one element applies ONLY to that element. The SDK
