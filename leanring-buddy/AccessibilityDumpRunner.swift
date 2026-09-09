@@ -267,8 +267,23 @@ enum AccessibilityDumpRunner {
             usesHighResolutionTier: false
         )
 
+        // Loud, first, and phrased as a verdict — not a `true` sitting under the
+        // number it invalidates. Measured 2026-09-09: Claude Desktop read as 46
+        // nodes / 9 actionable for an entire session of surveys, checkpoints and a
+        // retraction, with `truncated by budget true` printed under it every time.
+        // Raising the depth gave 1,684 nodes and 917 actionable. Nobody read the flag.
+        let truncationBanner = snapshot.wasTruncatedByBudget
+            ? """
+              ⚠️  TRUNCATED — every count below is a floor, not a measurement.
+                  The walk stopped at depth \(snapshot.deepestLevelReached) / \(snapshot.nodeCount) nodes
+                  because it hit OUR budget, not the end of the app's tree.
+                  Do not compare this app to an untruncated one.
+
+              """
+            : ""
+
         let metricsText = """
-        application            \(snapshot.applicationName) (\(snapshot.bundleIdentifier))
+        \(truncationBanner)application            \(snapshot.applicationName) (\(snapshot.bundleIdentifier))
 
         ACCESSIBILITY PATH
         walk duration          \(String(format: "%.1f", snapshot.walkDurationInSeconds * 1000)) ms

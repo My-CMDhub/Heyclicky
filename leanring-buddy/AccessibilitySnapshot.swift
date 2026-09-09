@@ -149,6 +149,31 @@ enum AccessibilityTreeWalker {
     /// Both systems describe the same pixel; they disagree only about which
     /// way is down. Skipping this conversion does not crash — it silently
     /// mirrors every frame vertically, which is why it is unit tested.
+    /// Ask an Electron app to build its accessibility tree.
+    ///
+    /// Electron gates tree construction behind `AXManualAccessibility` so that
+    /// the cost is only paid when an assistive client actually asks. Until it is
+    /// set, the app answers with a near-empty tree — which reads exactly like an
+    /// app with no accessibility support, and is why our first Electron
+    /// measurements were wrong.
+    ///
+    /// **Set it blind.** The attribute deliberately does not appear in
+    /// `AXUIElementCopyAttributeNames` or Accessibility Inspector, so probing for
+    /// it first will always say unsupported. A failure here is information, not
+    /// an error: native apps have no such attribute and return
+    /// `kAXErrorAttributeUnsupported`, which tells us the app was never gated.
+    ///
+    /// Deliberately NOT `AXEnhancedUserInterface`, which is Chrome's equivalent
+    /// switch and is documented to break window positioning for window managers.
+    @discardableResult
+    static func requestManualAccessibility(from applicationElement: AXUIElement) -> AXError {
+        AXUIElementSetAttributeValue(
+            applicationElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        )
+    }
+
     static func convertAccessibilityFrameToAppKitFrame(
         _ accessibilityFrame: CGRect,
         primaryDisplayHeightInPoints: CGFloat
@@ -219,7 +244,7 @@ enum AccessibilityTreeWalker {
     /// Fine for the dump runner; move to a background actor if the overlay
     /// ever needs to walk while the UI stays responsive.
     static func snapshotFocusedWindow(
-        maximumDepth: Int = 25,
+        maximumDepth: Int = 120,
         maximumNodeCount: Int = 2000
     ) throws -> AccessibilityWindowSnapshot {
         guard AXIsProcessTrusted() else {
@@ -239,11 +264,69 @@ enum AccessibilityTreeWalker {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)
 
         let applicationElement = AXUIElementCreateApplication(frontmostApplication.processIdentifier)
+        // A native app has no such attribute and answers kAXErrorAttributeUnsupported
+        // (-25205) — that is the "you were never gated" reply, not a failure. Only an
+        // app that accepted it was building its tree on demand, and only that app
+        // needs a moment to build one, so nothing else pays for this.
+        // --ax-no-manual isolates the two variables: this session found a huge
+        // Electron result and needs to know whether it came from the attribute or
+        // from raising the depth budget.
+        let manualAccessibilityResult = CommandLine.arguments.contains("--ax-no-manual")
+            ? AXError.attributeUnsupported
+            : requestManualAccessibility(from: applicationElement)
+        let wasGatedApp = manualAccessibilityResult == .success
 
-        guard let focusedWindowElement = copyElementAttribute(
+        // A gated app has to *construct* its tree after saying yes, and it does not
+        // announce when it is done. Measured 2026-09-09: Cursor accepts the
+        // attribute and still has no focused window 250 ms later, so a single sleep
+        // reads as "this app has no window" — the same silent-zero mistake in a new
+        // costume. Retry until the window appears instead of guessing a duration.
+        var focusedWindowElement = copyElementAttribute(
             from: applicationElement,
             attribute: kAXFocusedWindowAttribute
-        ) else {
+        )
+        if wasGatedApp {
+            var attemptsRemaining = 20   // 20 x 100 ms = 2 s ceiling
+            while focusedWindowElement == nil, attemptsRemaining > 0 {
+                Thread.sleep(forTimeInterval: 0.1)
+                focusedWindowElement = copyElementAttribute(
+                    from: applicationElement,
+                    attribute: kAXFocusedWindowAttribute
+                )
+                attemptsRemaining -= 1
+            }
+            print("🔓 AXManualAccessibility accepted by \(frontmostApplication.localizedName ?? "?") — window after \((20 - attemptsRemaining) * 100) ms")
+        } else {
+            print("🔒 not gated (AXError \(manualAccessibilityResult.rawValue)) — native app, tree was always there")
+        }
+
+        // AXFocusedWindow is not universal. Fall back through the other two window
+        // attributes before concluding there is no window, and print what the app
+        // actually publishes so a failure names its own cause instead of guessing.
+        if focusedWindowElement == nil {
+            focusedWindowElement = copyElementAttribute(
+                from: applicationElement,
+                attribute: kAXMainWindowAttribute
+            )
+            if focusedWindowElement != nil { print("   ↳ no AXFocusedWindow; used AXMainWindow") }
+        }
+        if focusedWindowElement == nil {
+            var windowsValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                applicationElement, kAXWindowsAttribute as CFString, &windowsValue
+            ) == .success,
+               let windows = windowsValue as? [AXUIElement], let first = windows.first {
+                focusedWindowElement = first
+                print("   ↳ no AXFocusedWindow/AXMainWindow; used AXWindows[0] of \(windows.count)")
+            }
+        }
+        if focusedWindowElement == nil {
+            var names: CFArray?
+            AXUIElementCopyAttributeNames(applicationElement, &names)
+            print("   ↳ application element publishes: \((names as? [String] ?? []).joined(separator: ", "))")
+        }
+
+        guard let focusedWindowElement else {
             throw AccessibilitySnapshotError.noFocusedWindow
         }
 
