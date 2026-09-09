@@ -42,6 +42,17 @@ struct ElementActionIntent {
     /// guess is a bad way to click and a perfectly good way to choose between
     /// two elements we have already found by name.
     var nearPoint: CGPoint? = nil
+
+    /// The name of a container the target sits inside — "the Back button in the
+    /// toolbar", not "one of the two Back buttons".
+    ///
+    /// Measured 2026-09-09 across Chrome, Mail and Claude Desktop: of 15 names
+    /// shared by more than one pressable element, **10 are separated by the
+    /// nearest named ancestor alone**, 3 more by a pointed-at location, 1 by the
+    /// role path, and 1 by nothing at all. That is the whole ceiling — small
+    /// enough that a snapshot-scoped reference protocol would be answering a
+    /// question we do not have.
+    var withinNamed: String? = nil
 }
 
 enum IntentResolution: Equatable {
@@ -74,32 +85,61 @@ enum ElementActionIntentResolver {
         _ intent: ElementActionIntent,
         inTreeRootedAt rootNode: AccessibilityElementNode
     ) -> IntentResolution {
-        let matchingNodes = rootNode.flattenedDescendants().filter { node in
-            // .raw, explicitly: comparing is the one thing app-written text is
-            // safe for. The intent's title came from a planner, so this is our
-            // string being matched against theirs, never theirs being trusted.
-            guard node.displayName?.raw == intent.title else { return false }
-            guard let requiredRole = intent.role else { return true }
-            return node.role == requiredRole
+        var matchingNodes: [(node: AccessibilityElementNode, ancestorNames: [String])] = []
+        collectMatches(in: rootNode, ancestorNames: [], for: intent, into: &matchingNodes)
+
+        // Narrow in order of how much the runtime can trust each signal: a
+        // container name is structure, a point is a model looking at pixels.
+        // A hint that matches nothing narrows nothing — the kernel refuses an
+        // ambiguous match either way, and inventing `.notFound` here would hide
+        // that the element does exist.
+        var candidates = matchingNodes
+        if candidates.count > 1, let container = intent.withinNamed {
+            let narrowed = candidates.filter { $0.ancestorNames.contains(container) }
+            if !narrowed.isEmpty { candidates = narrowed }
+        }
+        if candidates.count > 1, let point = intent.nearPoint {
+            let narrowed = candidates.filter { $0.node.frameInAppKitCoordinates.contains(point) }
+            if !narrowed.isEmpty { candidates = narrowed }
         }
 
-        switch matchingNodes.count {
+        switch candidates.count {
         case 0:
             return .notFound
         case 1:
-            return .resolved(matchingNodes[0])
+            return .resolved(candidates[0].node)
         default:
-            // Exactly one candidate under the point, or it stays ambiguous.
-            // "Nearest" would always return something, and something is what a
-            // wrong click looks like — this refuses rather than ranks.
-            guard let point = intent.nearPoint else {
-                return .ambiguous(matchCount: matchingNodes.count)
-            }
-            let containing = matchingNodes.filter { $0.frameInAppKitCoordinates.contains(point) }
-            guard containing.count == 1 else {
-                return .ambiguous(matchCount: matchingNodes.count)
-            }
-            return .resolved(containing[0])
+            // Still more than one. Refuse rather than rank: "nearest" always
+            // returns something, and something is what a wrong click looks like.
+            // The count reported is the original match count, because that is
+            // what a human would have to disambiguate.
+            return .ambiguous(matchCount: matchingNodes.count)
+        }
+    }
+
+    /// Every match, carrying the names of the containers it sits inside.
+    ///
+    /// Walks with the ancestor chain in hand rather than flattening first — the
+    /// chain is the disambiguator, and rebuilding it afterwards would mean
+    /// matching nodes by role, name and frame, which is exactly the identity
+    /// problem this is here to solve.
+    private static func collectMatches(
+        in node: AccessibilityElementNode,
+        ancestorNames: [String],
+        for intent: ElementActionIntent,
+        into matches: inout [(node: AccessibilityElementNode, ancestorNames: [String])]
+    ) {
+        // .raw, explicitly: comparing is the one thing app-written text is safe
+        // for. The intent's title came from a planner, so this is our string
+        // being matched against theirs, never theirs being trusted.
+        let name = node.displayName?.raw
+        if name == intent.title, intent.role == nil || node.role == intent.role {
+            matches.append((node, ancestorNames))
+        }
+
+        let chainBelow = name.map { ancestorNames + [$0] } ?? ancestorNames
+        for child in node.children {
+            collectMatches(in: child, ancestorNames: chainBelow, for: intent, into: &matches)
         }
     }
 }

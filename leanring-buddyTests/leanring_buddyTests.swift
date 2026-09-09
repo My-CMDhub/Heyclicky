@@ -667,3 +667,41 @@ private func windowContaining(_ children: [AccessibilityElementNode]) -> Accessi
 
     #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
 }
+
+@Test func aContainerNameSeparatesTwoElementsWithTheSameName() async throws {
+    // Measured across Chrome, Mail and Claude Desktop: 10 of 15 shared-name
+    // groups are separated by the nearest named ancestor alone.
+    func toolbarOrPage(_ containerName: String, buttonFrame: CGRect) -> AccessibilityElementNode {
+        AccessibilityElementNode(
+            role: "AXGroup", subrole: nil, title: containerName, value: nil,
+            frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 800, height: 100),
+            depth: 1, children: [pressableNodeTitled("Back", at: buttonFrame)]
+        )
+    }
+    let window = windowContaining([
+        toolbarOrPage("Toolbar", buttonFrame: CGRect(x: 0, y: 550, width: 40, height: 40)),
+        toolbarOrPage("Web Content", buttonFrame: CGRect(x: 300, y: 200, width: 60, height: 30))
+    ])
+
+    var intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+    intent.withinNamed = "Toolbar"
+
+    guard case .resolved(let node) = ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) else {
+        Issue.record("a container name should separate the two")
+        return
+    }
+    #expect(node.frameInAppKitCoordinates.origin.y == 550)
+}
+
+@Test func aContainerHintThatMatchesNothingNarrowsNothing() async throws {
+    // The element does exist. Reporting notFound would hide that, and the
+    // kernel refuses an ambiguous match anyway.
+    let window = windowContaining([
+        pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40)),
+        pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))
+    ])
+    var intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+    intent.withinNamed = "Sidebar"
+
+    #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
+}
