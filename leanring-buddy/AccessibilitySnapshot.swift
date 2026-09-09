@@ -176,6 +176,17 @@ struct AccessibilityWindowSnapshot {
     let subtreesSkippedFarOffScreen: Int
     let nodesSkippedFarOffScreen: Int
 
+    /// Containers where we asked the app which children are visible and walked
+    /// that window of them instead of all 18,004.
+    ///
+    /// Measured 2026-09-09: Mail's message list is one `AXTable` with 18,004
+    /// children that publishes `AXVisibleRows` = 11. The whole walk was that one
+    /// element. Reported separately from the off-screen skip because they answer
+    /// different questions — that one prunes a subtree by its *root's* frame,
+    /// this one prunes a container's *children* using the app's own answer.
+    let containersReducedToVisibleChildren: Int
+    let childrenElidedByVisibleSubset: Int
+
     /// True when the frontmost application changed while the walk was running.
     ///
     /// Measured 2026-09-08: Mail took 27.1 seconds to walk. Anything that slow is
@@ -391,6 +402,8 @@ enum AccessibilityTreeWalker {
         var subtreesLostToFailedReads = 0
         var subtreesSkippedFarOffScreen = 0
         var nodesSkippedFarOffScreen = 0
+        var containersReducedToVisibleChildren = 0
+        var childrenElidedByVisibleSubset = 0
 
         // How far off-screen still counts as reachable.
         //
@@ -425,7 +438,9 @@ enum AccessibilityTreeWalker {
             subtreesLostToFailedReads: &subtreesLostToFailedReads,
             reachableArea: reachableArea,
             subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
-            nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen
+            nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen,
+            containersReducedToVisibleChildren: &containersReducedToVisibleChildren,
+            childrenElidedByVisibleSubset: &childrenElidedByVisibleSubset
         )
         let walkDurationInSeconds = Date().timeIntervalSince(walkStartedAt)
 
@@ -449,6 +464,8 @@ enum AccessibilityTreeWalker {
             subtreesLostToFailedReads: subtreesLostToFailedReads,
             subtreesSkippedFarOffScreen: subtreesSkippedFarOffScreen,
             nodesSkippedFarOffScreen: nodesSkippedFarOffScreen,
+            containersReducedToVisibleChildren: containersReducedToVisibleChildren,
+            childrenElidedByVisibleSubset: childrenElidedByVisibleSubset,
             focusChangedDuringWalk: focusChangedDuringWalk
         )
     }
@@ -556,7 +573,9 @@ enum AccessibilityTreeWalker {
         subtreesLostToFailedReads: inout Int,
         reachableArea: CGRect?,
         subtreesSkippedFarOffScreen: inout Int,
-        nodesSkippedFarOffScreen: inout Int
+        nodesSkippedFarOffScreen: inout Int,
+        containersReducedToVisibleChildren: inout Int,
+        childrenElidedByVisibleSubset: inout Int
     ) -> AccessibilityElementNode? {
         guard budget.claimSlot(atDepth: depth) else { return nil }
 
@@ -618,7 +637,17 @@ enum AccessibilityTreeWalker {
             nodesSkippedFarOffScreen += childReadResult.children.count
         }
 
-        for childElement in isFarOffScreen ? [] : childReadResult.children {
+        // Ask the app which children are on screen, rather than reading 18,004
+        // frames to find out. See `visibleChildWindow`.
+        var childrenToWalk = isFarOffScreen ? [] : childReadResult.children
+        if !isFarOffScreen,
+           let window = visibleChildWindow(of: element, children: childReadResult.children) {
+            containersReducedToVisibleChildren += 1
+            childrenElidedByVisibleSubset += childReadResult.children.count - window.count
+            childrenToWalk = Array(childReadResult.children[window])
+        }
+
+        for childElement in childrenToWalk {
             guard let childNode = buildNode(
                 from: childElement,
                 depth: depth + 1,
@@ -630,7 +659,9 @@ enum AccessibilityTreeWalker {
                 subtreesLostToFailedReads: &subtreesLostToFailedReads,
                 reachableArea: reachableArea,
                 subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
-                nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen
+                nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen,
+                containersReducedToVisibleChildren: &containersReducedToVisibleChildren,
+                childrenElidedByVisibleSubset: &childrenElidedByVisibleSubset
             ) else { break }
 
             childNodes.append(childNode)
@@ -663,6 +694,81 @@ enum AccessibilityTreeWalker {
             publishedActionNames: publishedActionNames,
             accessibilityElement: element
         )
+    }
+
+    /// The children worth walking in a container that knows which of its own
+    /// children are on screen, or nil to walk them all.
+    ///
+    /// Measured 2026-09-09: Mail's message list is a single `AXTable` with
+    /// **18,004 children** that answers `AXVisibleRows` with **11**. Reading
+    /// every row's frame to discover that 17,993 of them are off-screen was the
+    /// entire 18,496-node walk. The app already knows the answer; the old
+    /// traversal simply never asked.
+    ///
+    /// The window is the visible run **plus one screenful either side**, which is
+    /// the same rule the off-screen subtree skip already uses (one window-height
+    /// of margin). A target one scroll away stays in the tree; a message list
+    /// stops being enumerated.
+    ///
+    /// Returns nil unless the saving is real: the extra attribute read costs one
+    /// IPC round trip, so it is only worth asking on containers big enough to pay
+    /// for it. Chromium publishes none of these attributes, so Electron apps take
+    /// this path zero times and are unaffected.
+    static let visibleChildAttributes = ["AXVisibleRows", "AXVisibleChildren", "AXVisibleCells"]
+    static let minimumChildrenToAskForVisibleSubset = 50
+
+    static func visibleChildWindow(
+        of element: AXUIElement,
+        children: [AXUIElement]
+    ) -> Range<Int>? {
+        guard children.count >= minimumChildrenToAskForVisibleSubset else { return nil }
+
+        var visible: [AXUIElement] = []
+        for attribute in visibleChildAttributes {
+            var out: AnyObject?
+            guard AXUIElementCopyAttributeValue(element, attribute as CFString, &out) == .success,
+                  let elements = out as? [AXUIElement], !elements.isEmpty else { continue }
+            visible = elements
+            break
+        }
+        guard !visible.isEmpty, visible.count < children.count else { return nil }
+
+        // Element identity is CFEqual, not ==. This is all local: no IPC, so the
+        // nested loop costs nothing next to a single cross-process read.
+        var firstVisible: Int?
+        var lastVisible: Int?
+        for (index, child) in children.enumerated()
+        where visible.contains(where: { CFEqual($0, child) }) {
+            if firstVisible == nil { firstVisible = index }
+            lastVisible = index
+        }
+
+        // The app named children we cannot find in its own children list. Trust
+        // the list we have and walk everything rather than guess a range.
+        guard let firstVisible, let lastVisible else { return nil }
+
+        return visibleWindowRange(
+            firstVisible: firstVisible,
+            lastVisible: lastVisible,
+            visibleCount: visible.count,
+            childCount: children.count
+        )
+    }
+
+    /// The index arithmetic, separated from the cross-process read so it can be
+    /// tested: margin either side, clamped to the array, and nil when the window
+    /// would cover everything anyway.
+    static func visibleWindowRange(
+        firstVisible: Int,
+        lastVisible: Int,
+        visibleCount: Int,
+        childCount: Int
+    ) -> Range<Int>? {
+        let margin = visibleCount
+        let lower = max(0, firstVisible - margin)
+        let upper = min(childCount, lastVisible + 1 + margin)
+        guard upper > lower, upper - lower < childCount else { return nil }
+        return lower..<upper
     }
 
     /// Asks an element which actions it publishes — "AXPress", "AXShowMenu",

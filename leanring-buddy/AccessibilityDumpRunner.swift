@@ -301,6 +301,7 @@ enum AccessibilityDumpRunner {
         nodes walked           \(snapshot.nodeCount)
         subtrees lost to error \(snapshot.subtreesLostToFailedReads)
         skipped far off-screen \(snapshot.subtreesSkippedFarOffScreen) subtrees, \(snapshot.nodesSkippedFarOffScreen) direct children not walked
+        visible-subset window  \(snapshot.containersReducedToVisibleChildren) containers, \(snapshot.childrenElidedByVisibleSubset) children elided
         focus changed mid-walk \(snapshot.focusChangedDuringWalk)
         ACTIONABLE elements    \(actionableElementCount)
 

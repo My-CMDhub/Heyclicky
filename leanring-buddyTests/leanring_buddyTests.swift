@@ -578,3 +578,31 @@ struct leanring_buddyTests {
 
     #expect(decision == .refuse(reason: ActionSafetyKernel.implausibleNameRefusalReason))
 }
+
+// MARK: - Walking only the children the app says are on screen
+
+@Test func visibleWindowKeepsOneScreenfulEitherSideOfWhatIsVisible() async throws {
+    // Mail's message list: 18,004 rows, 11 of them visible, sitting near the top.
+    let window = AccessibilityTreeWalker.visibleWindowRange(
+        firstVisible: 4, lastVisible: 14, visibleCount: 11, childCount: 18_004
+    )
+
+    // One screenful of margin either side, and nothing beyond it.
+    #expect(window == 0..<26)
+}
+
+@Test func visibleWindowClampsAtBothEndsOfTheChildList() async throws {
+    let atTheEnd = AccessibilityTreeWalker.visibleWindowRange(
+        firstVisible: 95, lastVisible: 99, visibleCount: 5, childCount: 100
+    )
+    #expect(atTheEnd == 90..<100)
+}
+
+@Test func visibleWindowIsRefusedWhenItWouldCoverEverything() async throws {
+    // Asking costs an IPC round trip. If the margin swallows the whole list
+    // there is nothing to save, and the tree should keep every child.
+    let pointless = AccessibilityTreeWalker.visibleWindowRange(
+        firstVisible: 0, lastVisible: 9, visibleCount: 10, childCount: 12
+    )
+    #expect(pointless == nil)
+}
