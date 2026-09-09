@@ -24,6 +24,21 @@ enum ActionSafetyKernel {
     /// Deliberately short — it grows only when a measured case demands it.
     static let navigationalPressRoles: Set<String> = ["AXButton", "AXRow", "AXCell"]
 
+    /// Roles for which writing a selection is ordinary navigation.
+    ///
+    /// `AXStaticText` is in here and deliberately not in the press list: a
+    /// sidebar row is anonymous, so the element a planner can name is the label
+    /// two levels inside it. Selecting changes what is selected — the write
+    /// itself cannot activate anything else.
+    static let navigationalSelectRoles: Set<String> = ["AXRow", "AXCell", "AXStaticText"]
+
+    static func navigationalRoles(for action: ElementAction) -> Set<String> {
+        switch action {
+        case .press: return navigationalPressRoles
+        case .select: return navigationalSelectRoles
+        }
+    }
+
     /// Words that make an action worth asking about regardless of role.
     /// Refusal reasons as constants, so the probe can classify a decision by
     /// identity rather than by re-typing the sentence and silently missing.
@@ -66,9 +81,14 @@ enum ActionSafetyKernel {
             return .refuse(reason: outsideBoundsRefusalReason)
         }
 
-        let requiredActionName = intent.action.accessibilityActionName
-        guard resolvedNode.publishedActionNames.contains(requiredActionName) else {
-            return .refuse(reason: "element does not publish \(requiredActionName)")
+        // Only an action has an action name. A property write has no entry in
+        // `AXUIElementCopyActionNames` to look for, and whether the attribute is
+        // settable is a question for the element at write time — a machine fact
+        // the performer establishes, not a policy this kernel can decide.
+        if let requiredActionName = intent.action.accessibilityActionName {
+            guard resolvedNode.publishedActionNames.contains(requiredActionName) else {
+                return .refuse(reason: "element does not publish \(requiredActionName)")
+            }
         }
 
         guard let name = resolvedNode.displayName, name.isPlausibleControlLabel else {
@@ -83,7 +103,7 @@ enum ActionSafetyKernel {
             return .requireConfirmation(reason: "title suggests a destructive action: \(matchedKeyword)")
         }
 
-        guard navigationalPressRoles.contains(resolvedNode.role) else {
+        guard navigationalRoles(for: intent.action).contains(resolvedNode.role) else {
             return .requireConfirmation(reason: "unrecognised role \(resolvedNode.role)")
         }
 

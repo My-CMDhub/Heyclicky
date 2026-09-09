@@ -142,8 +142,12 @@ enum AccessibilityDumpRunner {
                 continue
             }
 
+            guard let actionName = intent.action.accessibilityActionName else {
+                report.append("\(intent.title): this runner performs actions, and that intent is a property write")
+                continue
+            }
             let performResult = AccessibilityActionPerformer.perform(
-                intent.action.accessibilityActionName,
+                actionName,
                 on: element
             ).error
             guard performResult == .success else {
@@ -180,6 +184,20 @@ enum AccessibilityDumpRunner {
                 // share a prefix *and* a length; raise the cap if that shows up.
                 .compactMap { $0.displayName?.forDisplay }
         )
+    }
+
+    /// Every name in the tree — the fingerprint to diff when the thing that
+    /// changed is not a button.
+    ///
+    /// Measured 2026-09-10, and it cost a wrong conclusion: selecting a Finder
+    /// sidebar row navigated the window (219 nodes before, 99 after) while the
+    /// *pressable* set barely moved, so the verifier reported "nothing changed"
+    /// about a window that had visibly changed folder. Finder has ~12 pressable
+    /// elements and hundreds of files, because files are selected and
+    /// double-clicked, never pressed. A fingerprint has to cover what the action
+    /// can move.
+    static func namedElementFingerprint(in rootNode: AccessibilityElementNode) -> Set<String> {
+        Set(rootNode.flattenedDescendants().compactMap { $0.displayName?.forDisplay })
     }
 
     /// Re-walks until the set of pressable elements differs from before, or the
@@ -701,6 +719,142 @@ enum AccessibilityDumpRunner {
         NSApplication.shared.terminate(nil)
     }
 
+    // MARK: - Phase 4: selecting, for the apps whose navigation cannot be pressed
+
+    /// One end-to-end selection: resolve a name, walk up to something the app
+    /// says is selectable, let the kernel decide, write, and verify by looking.
+    ///
+    ///     open -a Clicky.app --args --ax-select Accessibility
+    static func runSelect() async {
+        let wanted: String = {
+            let arguments = CommandLine.arguments
+            guard let index = arguments.firstIndex(of: "--ax-select"),
+                  arguments.indices.contains(index + 1),
+                  !arguments[index + 1].hasPrefix("--") else { return "Accessibility" }
+            return arguments[index + 1]
+        }()
+
+        for remainingSeconds in stride(from: 5, through: 1, by: -1) {
+            print("🧪 J.A.R.V.I.S.: focus the window — selecting \(wanted) in \(remainingSeconds)")
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+
+        var report: [String] = ["SELECT \(wanted)"]
+
+        guard let snapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+              let rootNode = snapshot.rootNode else {
+            print("❌ could not read the focused window")
+            NSApplication.shared.terminate(nil)
+            return
+        }
+        report.append("window: \(snapshot.applicationName)   nodes: \(snapshot.nodeCount)")
+
+        let intent = ElementActionIntent(role: nil, title: wanted, action: .select)
+        let resolution = ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode)
+
+        let resolvedNode: AccessibilityElementNode
+        switch resolution {
+        case .resolved(let node):
+            resolvedNode = node
+        case .notFound:
+            report.append("resolve: NOT FOUND")
+            finishSelect(report)
+            return
+        case .ambiguous(let count):
+            report.append("resolve: AMBIGUOUS — \(count) elements are named that")
+            finishSelect(report)
+            return
+        }
+
+        let frame = resolvedNode.frameInAppKitCoordinates
+        report.append("resolved: \(resolvedNode.role) \(resolvedNode.displayName?.forDisplay ?? "(unnamed)") \(frame)")
+
+        switch ActionSafetyKernel.evaluate(
+            intent: intent,
+            resolvedNode: resolvedNode,
+            matchCount: 1,
+            visibleBounds: rootNode.frameInAppKitCoordinates
+        ) {
+        case .refuse(let reason):
+            report.append("kernel: REFUSED — \(reason)")
+            finishSelect(report)
+            return
+        case .requireConfirmation(let reason):
+            report.append("kernel: would ask a human — \(reason). Proceeding: this is an instrumented run.")
+        case .allow:
+            report.append("kernel: allow")
+        }
+
+        guard let chain = ElementReachability.ancestorChain(to: resolvedNode, from: rootNode) else {
+            report.append("no ancestor chain — cannot look upward for something selectable")
+            finishSelect(report)
+            return
+        }
+        report.append("chain: " + chain.map(\.role).joined(separator: " > "))
+
+        let namesBefore = namedElementFingerprint(in: rootNode)
+        let outcome = AccessibilitySelectionPerformer.select(chainFromRoot: chain)
+
+        switch outcome {
+        case .selected(let path, let levelsUp, let milliseconds, let readBackTrue):
+            let selectedRole = chain[chain.count - 1 - levelsUp].role
+            report.append("write: \(path.rawValue) — target \(selectedRole), \(levelsUp) level(s) above the named element, \(milliseconds) ms")
+            report.append("read back: AXSelected is \(readBackTrue ? "true" : "NOT true — the write was accepted and ignored")")
+        case .writeFailed(let error, let levelsUp, let milliseconds):
+            report.append("write: FAILED AXError \(error.rawValue) at \(levelsUp) level(s) up after \(milliseconds) ms")
+            finishSelect(report)
+            return
+        case .noSelectableAncestor(let levels):
+            report.append("write: nothing in \(levels) levels publishes a settable AXSelected")
+            finishSelect(report)
+            return
+        case .noLiveElement:
+            report.append("write: no live element — this tree came from a test, not a walk")
+            finishSelect(report)
+            return
+        }
+
+        // The read-back says the attribute took. Only a second walk says the app
+        // did anything about it.
+        let verification = ActionVerifier.verify { laterSnapshot in
+            guard let laterRoot = laterSnapshot.rootNode else { return false }
+            return namedElementFingerprint(in: laterRoot) != namesBefore
+        }
+        switch verification {
+        case .confirmed(let milliseconds):
+            report.append("verified: the world changed after \(milliseconds) ms")
+            if let laterSnapshot = try? AccessibilityTreeWalker.snapshotFocusedWindow(),
+               let laterRoot = laterSnapshot.rootNode {
+                let appeared = namedElementFingerprint(in: laterRoot).subtracting(namesBefore).sorted()
+                report.append("  appeared: \(appeared.isEmpty ? "(none)" : appeared.prefix(8).joined(separator: ", "))")
+            }
+        case .notObserved(let milliseconds):
+            report.append("verified: NOTHING CHANGED in \(milliseconds) ms — the write landed and the app ignored it")
+        case .couldNotReadWindow:
+            report.append("verified: could not read the window afterwards")
+        }
+
+        // The immediate read-back can be false while the app is still applying
+        // the change. Ask again once the world has settled, so "accepted and
+        // ignored" is not confused with "not yet".
+        if case .selected(_, let levelsUp, _, _) = outcome,
+           let element = chain[chain.count - 1 - levelsUp].accessibilityElement {
+            let settled = AccessibilitySelectionPerformer.readsBackSelected(element)
+            report.append("settled read-back: AXSelected is \(settled ? "true" : "still not true")")
+        }
+
+        finishSelect(report)
+    }
+
+    private static func finishSelect(_ report: [String]) {
+        let text = report.joined(separator: "\n")
+        print("\n" + text)
+        let outputDirectory = URL(fileURLWithPath: "/private/tmp/jarvis-ax-action", isDirectory: true)
+        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        try? text.write(to: outputDirectory.appendingPathComponent("select.txt"), atomically: true, encoding: .utf8)
+        NSApplication.shared.terminate(nil)
+    }
+
     // MARK: - Phase 3: a two-step workflow that survives a wait
 
     /// Presses a target, waits for the app to settle, then presses a target that
@@ -939,8 +1093,12 @@ enum AccessibilityDumpRunner {
             return false
         }
 
+        guard let actionName = intent.action.accessibilityActionName else {
+            report.append("step one is a property write; this runner performs actions")
+            return false
+        }
         let performResult = AccessibilityActionPerformer.perform(
-            intent.action.accessibilityActionName,
+            actionName,
             on: element
         ).error
         guard performResult == .success else {

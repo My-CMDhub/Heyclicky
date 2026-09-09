@@ -705,3 +705,71 @@ private func windowContaining(_ children: [AccessibilityElementNode]) -> Accessi
 
     #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
 }
+
+// MARK: - Selecting: the verb that is a property write
+
+@Test func theKernelAllowsSelectingALabelItWouldRefuseToPress() async throws {
+    // A System Settings sidebar row is anonymous; the name a planner can say
+    // belongs to the AXStaticText two levels inside it, and that publishes only
+    // AXShowMenu. Pressing it is meaningless. Selecting it is the navigation.
+    let label = AccessibilityElementNode(
+        role: "AXStaticText", subrole: nil, title: nil, value: "Accessibility",
+        frameInAppKitCoordinates: CGRect(x: 20, y: 400, width: 120, height: 20),
+        depth: 3, children: [], publishedActionNames: ["AXShowMenu"]
+    )
+    let visibleBounds = CGRect(x: 0, y: 0, width: 800, height: 600)
+
+    let pressDecision = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Accessibility", action: .press),
+        resolvedNode: label, matchCount: 1, visibleBounds: visibleBounds
+    )
+    #expect(pressDecision == .refuse(reason: "element does not publish \(kAXPressAction)"))
+
+    let selectDecision = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Accessibility", action: .select),
+        resolvedNode: label, matchCount: 1, visibleBounds: visibleBounds
+    )
+    #expect(selectDecision == .allow)
+}
+
+@Test func selectingStillObeysEveryRefusalPressDoes() async throws {
+    // Dropping the action check must not drop the rest of the kernel with it.
+    func label(frame: CGRect) -> AccessibilityElementNode {
+        AccessibilityElementNode(
+            role: "AXStaticText", subrole: nil, title: nil, value: "Accessibility",
+            frameInAppKitCoordinates: frame, depth: 3, children: [],
+            publishedActionNames: ["AXShowMenu"]
+        )
+    }
+    let intent = ElementActionIntent(role: nil, title: "Accessibility", action: .select)
+    let visibleBounds = CGRect(x: 0, y: 0, width: 800, height: 600)
+
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent, resolvedNode: label(frame: .zero), matchCount: 1, visibleBounds: visibleBounds
+    ) == .refuse(reason: ActionSafetyKernel.zeroAreaRefusalReason))
+
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent,
+        resolvedNode: label(frame: CGRect(x: 20, y: -400, width: 120, height: 20)),
+        matchCount: 1, visibleBounds: visibleBounds
+    ) == .refuse(reason: ActionSafetyKernel.outsideBoundsRefusalReason))
+
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent,
+        resolvedNode: label(frame: CGRect(x: 20, y: 400, width: 120, height: 20)),
+        matchCount: 3, visibleBounds: visibleBounds
+    ) == .refuse(reason: "3 elements match that title"))
+}
+
+@Test func selectingATreeWithNoLiveHandlesSaysSoInsteadOfBlamingTheApp() async throws {
+    // Hand-built nodes carry no AXUIElement. "Nothing was selectable" and
+    // "there was nothing to ask" are different answers.
+    let label = AccessibilityElementNode(
+        role: "AXStaticText", subrole: nil, title: nil, value: "Accessibility",
+        frameInAppKitCoordinates: CGRect(x: 20, y: 400, width: 120, height: 20),
+        depth: 1, children: []
+    )
+    let outcome = AccessibilitySelectionPerformer.select(chainFromRoot: [label])
+
+    #expect(outcome == .noLiveElement)
+}

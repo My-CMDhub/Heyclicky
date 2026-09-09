@@ -60,6 +60,11 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if CommandLine.arguments.contains("--ax-select") {
+            Task { await AccessibilityDumpRunner.runSelect() }
+            return
+        }
+
         if CommandLine.arguments.contains("--ax-task") {
             Task { await AccessibilityDumpRunner.runTask() }
             return

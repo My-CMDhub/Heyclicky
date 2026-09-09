@@ -13,10 +13,23 @@ import Foundation
 enum ElementAction {
     case press
 
-    var accessibilityActionName: String {
+    /// Selecting is a property write, not an action.
+    ///
+    /// Measured 2026-09-09 and again 2026-09-10: System Settings' 39 sidebar
+    /// rows publish only `AXShowDefaultUI` / `AXShowAlternateUI` — no `AXPress`,
+    /// ever. A human clicks them and the app navigates. The verb that does the
+    /// same thing through Accessibility is writing `AXSelected = true`, which is
+    /// not in the action API at all.
+    case select
+
+    /// The published action this needs, or nil when the verb is a property
+    /// write and there is no action to look for.
+    var accessibilityActionName: String? {
         switch self {
         case .press:
             return kAXPressAction
+        case .select:
+            return nil
         }
     }
 }
@@ -172,6 +185,158 @@ enum AccessibilityActionPerformer {
         let startedAt = Date()
         let error = AXUIElementPerformAction(element, actionName as CFString)
         return (error, Int(Date().timeIntervalSince(startedAt) * 1000))
+    }
+}
+
+/// Selecting: the half of the action API that is not an action.
+///
+/// Measured 2026-09-10 on System Settings, each path tested in isolation and
+/// from a pane it was not already on:
+///
+///     AXSelected = true on the AXRow                  AXError 0, window "" -> "Accessibility"
+///     AXSelectedRows = [row] on the AXOutline         AXError 0, window "Accessibility" -> "Sound"
+///
+/// Then Finder split them apart. Measured the same day, each in isolation:
+///
+///     Finder, AXSelected = true on the row       AXError 0, reads back TRUE, window did not move
+///     Finder, AXSelectedRows = [row] on outline  AXError 0, Frameworks -> Documents -> Applications
+///
+/// So the row write is not enough. Finder accepted it, reported the row as
+/// selected, and navigated nowhere — the selection state moved and the app did
+/// not act on it. **The container write is the one that works in both apps**, so
+/// it is tried first and the row write is the fallback.
+///
+/// The awkward part is not the write, it is the aim. A sidebar row is
+/// **anonymous** — its label lives two levels below it:
+///
+///     AXRow                     [AXShowDefaultUI, AXShowAlternateUI]
+///       AXCell                  []
+///         AXStaticText "Sound"  [AXShowMenu]
+///
+/// So a planner naming "Sound" resolves to a static text that cannot be
+/// selected, sitting inside a row that can. We walk up from what was named to
+/// the first ancestor whose `AXSelected` the app says is settable — asking the
+/// element, never assuming from its role.
+enum AccessibilitySelectionPerformer {
+
+    static let selectedAttribute = "AXSelected"
+
+    /// Asked of the container, in order. `AXSelectedRows` is what an `AXOutline`
+    /// and an `AXTable` publish; `AXSelectedChildren` is the generic form, and
+    /// Apple's own header says it is writable "only if there is no other way to
+    /// manipulate the set of selected elements" — which is this case exactly.
+    static let containerSelectionAttributes = ["AXSelectedRows", "AXSelectedChildren"]
+    static let selectionTimeoutInSeconds: Float = 5.0
+
+    /// Which write did it. "It worked" and "it worked the other way" are
+    /// different facts, and the next app will need to know which.
+    enum SelectionPath: String, Equatable {
+        case containerSelectedRows = "AXSelectedRows on the container"
+        case containerSelectedChildren = "AXSelectedChildren on the container"
+        case elementSelected = "AXSelected on the element itself"
+    }
+
+    enum Outcome: Equatable {
+        /// `levelsAboveTarget` is 0 when the named element was itself selectable.
+        case selected(path: SelectionPath, levelsAboveTarget: Int, milliseconds: Int, readBackTrue: Bool)
+        case writeFailed(error: AXError, levelsAboveTarget: Int, milliseconds: Int)
+        case noSelectableAncestor(levelsInspected: Int)
+        case noLiveElement
+    }
+
+    /// `chainFromRoot` is the path the resolver walked: root first, named
+    /// element last.
+    static func select(chainFromRoot: [AccessibilityElementNode]) -> Outcome {
+        guard !chainFromRoot.isEmpty else { return .noLiveElement }
+
+        var sawALiveElement = false
+        for (levelsUp, node) in chainFromRoot.reversed().enumerated() {
+            guard let element = node.accessibilityElement else { continue }
+            sawALiveElement = true
+            guard isSelectable(element) else { continue }
+
+            // A write animates. It must not inherit the walker's read timeout,
+            // for the same reason a press does not.
+            AXUIElementSetMessagingTimeout(element, selectionTimeoutInSeconds)
+
+            // The container holding this row, if the chain has one.
+            let rowIndex = chainFromRoot.count - 1 - levelsUp
+            let container = rowIndex > 0 ? chainFromRoot[rowIndex - 1].accessibilityElement : nil
+
+            var lastError: AXError = .success
+            var lastMilliseconds = 0
+
+            if let container {
+                AXUIElementSetMessagingTimeout(container, selectionTimeoutInSeconds)
+                for attribute in containerSelectionAttributes where isSettable(container, attribute) {
+                    let startedAt = Date()
+                    let error = AXUIElementSetAttributeValue(
+                        container, attribute as CFString, [element] as CFArray
+                    )
+                    lastMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1000)
+                    lastError = error
+                    guard error == .success else { continue }
+                    return .selected(
+                        path: attribute == "AXSelectedRows" ? .containerSelectedRows : .containerSelectedChildren,
+                        levelsAboveTarget: levelsUp,
+                        milliseconds: lastMilliseconds,
+                        readBackTrue: readsBackSelected(element)
+                    )
+                }
+            }
+
+            let startedAt = Date()
+            let error = AXUIElementSetAttributeValue(
+                element, selectedAttribute as CFString, kCFBooleanTrue
+            )
+            let milliseconds = Int(Date().timeIntervalSince(startedAt) * 1000)
+
+            guard error == .success else {
+                return .writeFailed(
+                    error: error == .success ? lastError : error,
+                    levelsAboveTarget: levelsUp,
+                    milliseconds: milliseconds
+                )
+            }
+
+            return .selected(
+                path: .elementSelected,
+                levelsAboveTarget: levelsUp,
+                milliseconds: milliseconds,
+                readBackTrue: readsBackSelected(element)
+            )
+        }
+
+        // "Nothing was selectable" and "there was nothing to ask" are different
+        // answers, and returning the first for the second is how a dead handle
+        // becomes a fact about the app.
+        return sawALiveElement
+            ? .noSelectableAncestor(levelsInspected: chainFromRoot.count)
+            : .noLiveElement
+    }
+
+    /// `.success` means the message was delivered. Reading the value back is the
+    /// cheapest evidence that it landed — and measured on Finder, still not
+    /// enough on its own: the row read back as selected while the window never
+    /// moved. Only a second walk settles that.
+    static func readsBackSelected(_ element: AXUIElement) -> Bool {
+        var readBack: AnyObject?
+        AXUIElementCopyAttributeValue(element, selectedAttribute as CFString, &readBack)
+        return (readBack as? Bool) == true
+    }
+
+    static func isSettable(_ element: AXUIElement, _ attribute: String) -> Bool {
+        var isSettable: DarwinBoolean = false
+        let error = AXUIElementIsAttributeSettable(element, attribute as CFString, &isSettable)
+        return error == .success && isSettable.boolValue
+    }
+
+    /// Asks the element, because a role is a convention and this is a fact.
+    /// `AXIsAttributeSettable` reported true for every System Settings row
+    /// measured, and every one of those writes then worked — but it is the
+    /// element being asked, not us guessing from `AXRow`.
+    static func isSelectable(_ element: AXUIElement) -> Bool {
+        isSettable(element, selectedAttribute)
     }
 }
 
