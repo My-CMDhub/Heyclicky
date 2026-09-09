@@ -30,6 +30,12 @@ enum ActionSafetyKernel {
     static let zeroAreaRefusalReason = "listed but not reachable: element has a zero-area frame"
     static let outsideBoundsRefusalReason = "listed but not reachable: element lies outside the visible bounds"
 
+    /// The name is the whole identity we act on, and the app wrote it. A label
+    /// that is empty, document-length, or carries a newline is not a control's
+    /// name — it is content that arrived in a name-shaped field, and letting it
+    /// name an action is how app-controlled text becomes an instruction.
+    static let implausibleNameRefusalReason = "listed but not usable as a target: the element's name is not a plain label"
+
     static let destructiveTitleKeywords = [
         "delete", "remove", "erase", "send", "buy", "pay", "purchase", "reset"
     ]
@@ -65,7 +71,14 @@ enum ActionSafetyKernel {
             return .refuse(reason: "element does not publish \(requiredActionName)")
         }
 
-        let lowercasedTitle = (resolvedNode.displayName ?? "").lowercased()
+        guard let name = resolvedNode.displayName, name.isPlausibleControlLabel else {
+            return .refuse(reason: implausibleNameRefusalReason)
+        }
+
+        // App-written text may only ever make the decision *more* cautious.
+        // A keyword here escalates to a question; nothing an app publishes can
+        // turn a question into an allow.
+        let lowercasedTitle = name.raw.lowercased()
         if let matchedKeyword = destructiveTitleKeywords.first(where: { lowercasedTitle.contains($0) }) {
             return .requireConfirmation(reason: "title suggests a destructive action: \(matchedKeyword)")
         }

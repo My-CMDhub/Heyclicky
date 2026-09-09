@@ -15,13 +15,15 @@ import ApplicationServices
 struct AccessibilityElementNode {
     let role: String
     let subrole: String?
-    let title: String?
-    let value: String?
+
+    /// Written by the target app, so they arrive labelled. See `UntrustedText`.
+    let title: UntrustedText?
+    let value: UntrustedText?
 
     /// AXDescription. System Settings' detail-pane rows are AXButtons with no
     /// title and no value — measured 2026-09-07, all 14 came back anonymous
     /// until this attribute was read.
-    let elementDescription: String?
+    let elementDescription: UntrustedText?
 
     let frameInAppKitCoordinates: CGRect
     let depth: Int
@@ -39,7 +41,7 @@ struct AccessibilityElementNode {
     /// An app may publish its label as AXTitle, AXDescription or AXValue, and
     /// System Settings uses a different one for each control type: nothing for
     /// rows, AXValue for sidebar labels, AXDescription for detail-pane buttons.
-    var displayName: String? { title ?? elementDescription ?? value }
+    var displayName: UntrustedText? { title ?? elementDescription ?? value }
 
     /// Whether this element is something an agent could actually act on:
     /// it has a name, it publishes at least one action, and it occupies space.
@@ -68,9 +70,11 @@ struct AccessibilityElementNode {
     ) {
         self.role = role
         self.subrole = subrole
-        self.title = title
-        self.value = value
-        self.elementDescription = elementDescription
+        // The single boundary where an app's strings enter our types, and
+        // therefore the only place the label has to be applied.
+        self.title = title.map(UntrustedText.init)
+        self.value = value.map(UntrustedText.init)
+        self.elementDescription = elementDescription.map(UntrustedText.init)
         self.frameInAppKitCoordinates = frameInAppKitCoordinates
         self.depth = depth
         self.children = children
@@ -249,17 +253,13 @@ enum AccessibilityTreeWalker {
         into lines: inout [String]
     ) {
         let indentation = String(repeating: "  ", count: node.depth)
-        let titleFragment = node.title.map { " \"\($0)\"" } ?? ""
-        let descriptionFragment = node.elementDescription.map { " desc=\"\($0)\"" } ?? ""
-        // A text area's AXValue is the entire document. Xcode with a file open
-        // would emit thousands of lines from one node, break the one-line-per-node
-        // contract, and turn "tree size" into a measurement of that text view.
-        // Truncated, but the true length is kept so nothing is hidden.
-        let valueFragment = node.value.map { rawValue -> String in
-            let singleLine = rawValue.replacingOccurrences(of: "\n", with: "\\n")
-            guard singleLine.count > 100 else { return " = \"\(singleLine)\"" }
-            return " = \"\(singleLine.prefix(100))…\" (\(rawValue.count) chars)"
-        } ?? ""
+        // All three fragments are app-written, so all three go through the
+        // same escape-and-cap. A text area's AXValue is the entire document, and
+        // a title containing a newline would forge a line in this dump — one
+        // node, two lines, and the count that follows becomes fiction.
+        let titleFragment = node.title.map { " " + $0.forDisplay } ?? ""
+        let descriptionFragment = node.elementDescription.map { " desc=" + $0.forDisplay } ?? ""
+        let valueFragment = node.value.map { " = " + $0.forDisplay } ?? ""
         let frameFragment = String(
             format: "(%.0f, %.0f, %.0f, %.0f)",
             node.frameInAppKitCoordinates.origin.x,

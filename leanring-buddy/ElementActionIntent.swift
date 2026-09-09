@@ -59,7 +59,10 @@ enum ElementActionIntentResolver {
         inTreeRootedAt rootNode: AccessibilityElementNode
     ) -> IntentResolution {
         let matchingNodes = rootNode.flattenedDescendants().filter { node in
-            guard node.displayName == intent.title else { return false }
+            // .raw, explicitly: comparing is the one thing app-written text is
+            // safe for. The intent's title came from a planner, so this is our
+            // string being matched against theirs, never theirs being trusted.
+            guard node.displayName?.raw == intent.title else { return false }
             guard let requiredRole = intent.role else { return true }
             return node.role == requiredRole
         }

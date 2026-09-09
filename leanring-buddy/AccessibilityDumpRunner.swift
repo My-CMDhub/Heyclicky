@@ -174,7 +174,11 @@ enum AccessibilityDumpRunner {
         Set(
             rootNode.flattenedDescendants()
                 .filter { $0.isActionable && $0.publishedActionNames.contains(kAXPressAction) }
-                .compactMap(\.displayName)
+                // The escaped form, because this set is both the diff
+                // fingerprint and the text printed in the report.
+                // ponytail: names longer than 100 chars collide only if they
+                // share a prefix *and* a length; raise the cap if that shows up.
+                .compactMap { $0.displayName?.forDisplay }
         )
     }
 
@@ -526,7 +530,7 @@ enum AccessibilityDumpRunner {
                 continue
             }
 
-            let intent = ElementActionIntent(role: node.role, title: name, action: .press)
+            let intent = ElementActionIntent(role: node.role, title: name.raw, action: .press)
             let matchCount: Int
             switch ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode) {
             case .resolved:
@@ -534,7 +538,7 @@ enum AccessibilityDumpRunner {
             case .ambiguous(let count):
                 matchCount = count
                 ambiguous += 1
-                ambiguousNames.insert(name)
+                ambiguousNames.insert(name.forDisplay)
             case .notFound:
                 matchCount = 0
             }
@@ -912,7 +916,7 @@ enum AccessibilityDumpRunner {
     private static func describe(_ attempt: ReachabilityAttempt) -> [String] {
         var lines: [String] = []
         lines.append("  SCROLL ATTEMPT")
-        lines.append("    scrollable ancestor  \(attempt.scrollContainerRole ?? "(none found)")\(attempt.scrollContainerName.map { " \"\($0)\"" } ?? "")")
+        lines.append("    scrollable ancestor  \(attempt.scrollContainerRole ?? "(none found)")\(attempt.scrollContainerName.map { " " + $0 } ?? "")")
         lines.append("    container frame      \(attempt.scrollContainerFrame.map(rectangleText) ?? "(none)")")
         lines.append("    visible bounds       \(rectangleText(attempt.visibleBoundsUsed))")
         lines.append("    direction            \(attempt.direction?.accessibilityActionName ?? "(none — already visible)")")

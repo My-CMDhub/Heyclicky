@@ -193,7 +193,7 @@ enum ElementReachability {
             ReachabilityAttempt(
                 outcome: outcome,
                 scrollContainerRole: container?.role,
-                scrollContainerName: container?.displayName,
+                scrollContainerName: container?.displayName?.forDisplay,
                 scrollContainerFrame: container?.frameInAppKitCoordinates,
                 visibleBoundsUsed: visibleBounds,
                 usedSyntheticScroll: usedSyntheticScroll,
@@ -227,7 +227,7 @@ enum ElementReachability {
         }
         let reresolveIntent = ElementActionIntent(
             role: node.role,
-            title: targetName,
+            title: targetName.raw,
             action: .press
         )
 
