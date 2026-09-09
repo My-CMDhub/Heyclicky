@@ -83,6 +83,23 @@ struct AccessibilityElementNode {
     }
 }
 
+/// An `AXUIElement` in a Swift `Set`.
+///
+/// CF types carry their own equality and hashing, and Swift will not use them
+/// for you. Measured 2026-09-09 on Chrome: without this the same "New tab"
+/// button appears **four times** in one window's tree, at two different depths.
+struct AccessibilityElementKey: Hashable {
+    let element: AXUIElement
+
+    static func == (lhs: AccessibilityElementKey, rhs: AccessibilityElementKey) -> Bool {
+        CFEqual(lhs.element, rhs.element)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(CFHash(element))
+    }
+}
+
 /// Bounds a tree walk and — critically — records that it was bounded.
 ///
 /// A truncated tree is indistinguishable from a genuinely shallow app, so a
@@ -186,6 +203,15 @@ struct AccessibilityWindowSnapshot {
     /// this one prunes a container's *children* using the app's own answer.
     let containersReducedToVisibleChildren: Int
     let childrenElidedByVisibleSubset: Int
+
+    /// Children skipped because that exact element was already in the tree.
+    ///
+    /// The Accessibility graph is not a tree. Measured 2026-09-09: Chrome
+    /// publishes its whole tab strip under more than one parent, so a
+    /// depth-first walk enumerated every toolbar button four times — and every
+    /// one of them then resolved as ambiguous, which is why nothing in Chrome
+    /// was addressable.
+    let duplicateElementsSkipped: Int
 
     /// True when the frontmost application changed while the walk was running.
     ///
@@ -404,6 +430,10 @@ enum AccessibilityTreeWalker {
         var nodesSkippedFarOffScreen = 0
         var containersReducedToVisibleChildren = 0
         var childrenElidedByVisibleSubset = 0
+        var duplicateElementsSkipped = 0
+        var visitedElements: Set<AccessibilityElementKey> = [
+            AccessibilityElementKey(element: focusedWindowElement)
+        ]
 
         // How far off-screen still counts as reachable.
         //
@@ -440,7 +470,9 @@ enum AccessibilityTreeWalker {
             subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
             nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen,
             containersReducedToVisibleChildren: &containersReducedToVisibleChildren,
-            childrenElidedByVisibleSubset: &childrenElidedByVisibleSubset
+            childrenElidedByVisibleSubset: &childrenElidedByVisibleSubset,
+            visitedElements: &visitedElements,
+            duplicateElementsSkipped: &duplicateElementsSkipped
         )
         let walkDurationInSeconds = Date().timeIntervalSince(walkStartedAt)
 
@@ -466,6 +498,7 @@ enum AccessibilityTreeWalker {
             nodesSkippedFarOffScreen: nodesSkippedFarOffScreen,
             containersReducedToVisibleChildren: containersReducedToVisibleChildren,
             childrenElidedByVisibleSubset: childrenElidedByVisibleSubset,
+            duplicateElementsSkipped: duplicateElementsSkipped,
             focusChangedDuringWalk: focusChangedDuringWalk
         )
     }
@@ -575,7 +608,9 @@ enum AccessibilityTreeWalker {
         subtreesSkippedFarOffScreen: inout Int,
         nodesSkippedFarOffScreen: inout Int,
         containersReducedToVisibleChildren: inout Int,
-        childrenElidedByVisibleSubset: inout Int
+        childrenElidedByVisibleSubset: inout Int,
+        visitedElements: inout Set<AccessibilityElementKey>,
+        duplicateElementsSkipped: inout Int
     ) -> AccessibilityElementNode? {
         guard budget.claimSlot(atDepth: depth) else { return nil }
 
@@ -647,6 +682,16 @@ enum AccessibilityTreeWalker {
             childrenToWalk = Array(childReadResult.children[window])
         }
 
+        // Each element once, whichever path reaches it first. Filtered here
+        // rather than at the top of the recursion because returning nil for a
+        // duplicate would stop the sibling loop, which reads a repeated element
+        // as an exhausted budget.
+        let beforeDeduplication = childrenToWalk.count
+        childrenToWalk = childrenToWalk.filter {
+            visitedElements.insert(AccessibilityElementKey(element: $0)).inserted
+        }
+        duplicateElementsSkipped += beforeDeduplication - childrenToWalk.count
+
         for childElement in childrenToWalk {
             guard let childNode = buildNode(
                 from: childElement,
@@ -661,7 +706,9 @@ enum AccessibilityTreeWalker {
                 subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
                 nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen,
                 containersReducedToVisibleChildren: &containersReducedToVisibleChildren,
-                childrenElidedByVisibleSubset: &childrenElidedByVisibleSubset
+                childrenElidedByVisibleSubset: &childrenElidedByVisibleSubset,
+                visitedElements: &visitedElements,
+                duplicateElementsSkipped: &duplicateElementsSkipped
             ) else { break }
 
             childNodes.append(childNode)

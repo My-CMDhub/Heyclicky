@@ -26,6 +26,22 @@ struct ElementActionIntent {
     let role: String?
     let title: String
     let action: ElementAction
+
+    /// Roughly where on screen the target is, in AppKit coordinates — what a
+    /// model looking at a screenshot can say and a tree cannot.
+    ///
+    /// Measured 2026-09-09: of the names shared by more than one pressable
+    /// element, the nearest named ancestor separates 5 of 7 in Mail but only 3
+    /// of 21 in Chrome, and the role path from the window separates **zero** in
+    /// either. The remaining 18 Chrome groups are siblings in the same container
+    /// with the same role — nothing structural tells them apart, and only their
+    /// position does.
+    ///
+    /// So this is the hybrid the project argues for, in one field: vision to see
+    /// which one the human means, structure to aim at its exact frame. A pixel
+    /// guess is a bad way to click and a perfectly good way to choose between
+    /// two elements we have already found by name.
+    var nearPoint: CGPoint? = nil
 }
 
 enum IntentResolution: Equatable {
@@ -73,7 +89,17 @@ enum ElementActionIntentResolver {
         case 1:
             return .resolved(matchingNodes[0])
         default:
-            return .ambiguous(matchCount: matchingNodes.count)
+            // Exactly one candidate under the point, or it stays ambiguous.
+            // "Nearest" would always return something, and something is what a
+            // wrong click looks like — this refuses rather than ranks.
+            guard let point = intent.nearPoint else {
+                return .ambiguous(matchCount: matchingNodes.count)
+            }
+            let containing = matchingNodes.filter { $0.frameInAppKitCoordinates.contains(point) }
+            guard containing.count == 1 else {
+                return .ambiguous(matchCount: matchingNodes.count)
+            }
+            return .resolved(containing[0])
         }
     }
 }

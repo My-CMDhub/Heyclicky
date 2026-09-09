@@ -606,3 +606,64 @@ struct leanring_buddyTests {
     )
     #expect(pointless == nil)
 }
+
+// MARK: - Choosing between elements that share a name
+
+private func pressableNodeTitled(_ title: String, at frame: CGRect) -> AccessibilityElementNode {
+    AccessibilityElementNode(
+        role: "AXButton", subrole: nil, title: title, value: nil,
+        frameInAppKitCoordinates: frame, depth: 1, children: [],
+        publishedActionNames: [kAXPressAction]
+    )
+}
+
+private func windowContaining(_ children: [AccessibilityElementNode]) -> AccessibilityElementNode {
+    AccessibilityElementNode(
+        role: "AXWindow", subrole: nil, title: "Chrome", value: nil,
+        frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 800, height: 600),
+        depth: 0, children: children
+    )
+}
+
+@Test func aPointedAtLocationSeparatesTwoElementsWithTheSameName() async throws {
+    // Measured: 18 of Chrome's 21 shared-name groups are siblings in the same
+    // container with the same role. Nothing structural tells them apart.
+    let window = windowContaining([
+        pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40)),
+        pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))
+    ])
+
+    var intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+    #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
+
+    intent.nearPoint = CGPoint(x: 20, y: 570)
+    guard case .resolved(let node) = ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) else {
+        Issue.record("a point inside exactly one candidate should resolve it")
+        return
+    }
+    #expect(node.frameInAppKitCoordinates.origin.y == 550)
+}
+
+@Test func aPointInsideNoCandidateStaysAmbiguous() async throws {
+    // The model's pixel guess is approximate. Missing every candidate is not a
+    // reason to pick the nearest — "something" is what a wrong click looks like.
+    let window = windowContaining([
+        pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40)),
+        pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))
+    ])
+    var intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+    intent.nearPoint = CGPoint(x: 700, y: 100)
+
+    #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
+}
+
+@Test func aPointInsideTwoOverlappingCandidatesStaysAmbiguous() async throws {
+    let window = windowContaining([
+        pressableNodeTitled("Back", at: CGRect(x: 0, y: 0, width: 100, height: 100)),
+        pressableNodeTitled("Back", at: CGRect(x: 50, y: 50, width: 100, height: 100))
+    ])
+    var intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+    intent.nearPoint = CGPoint(x: 75, y: 75)
+
+    #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
+}

@@ -302,6 +302,7 @@ enum AccessibilityDumpRunner {
         subtrees lost to error \(snapshot.subtreesLostToFailedReads)
         skipped far off-screen \(snapshot.subtreesSkippedFarOffScreen) subtrees, \(snapshot.nodesSkippedFarOffScreen) direct children not walked
         visible-subset window  \(snapshot.containersReducedToVisibleChildren) containers, \(snapshot.childrenElidedByVisibleSubset) children elided
+        duplicate elements     \(snapshot.duplicateElementsSkipped) skipped (already in the tree by another path)
         focus changed mid-walk \(snapshot.focusChangedDuringWalk)
         ACTIONABLE elements    \(actionableElementCount)
 
@@ -594,6 +595,83 @@ enum AccessibilityDumpRunner {
         for (reason, count) in refusalsByReason.sorted(by: { $0.value > $1.value }) {
             report.append("  refuse: \(reason)  \(count)")
         }
+        // What WOULD separate the elements that share a name? Refusing ambiguity
+        // is correct and it is also the resolver's ceiling — 19 of Mail's 42
+        // pressable elements and 76 of Chrome's 158 are refused for a shared
+        // name. Before designing an identifier, measure which one would work.
+        if !ambiguousNames.isEmpty {
+            let named = pressableNodes.filter { $0.displayName != nil }
+            let groups = Dictionary(grouping: named) { $0.displayName!.raw }
+                .filter { $0.value.count > 1 }
+
+            var separatedByAncestorName = 0
+            var separatedByRolePath = 0
+            var separatedByFrame = 0
+            var nestedDuplicates = 0
+            var separatedByNeither = 0
+            var nestedExamples: Set<String> = []
+
+            for (_, siblings) in groups {
+                let ancestorNames = siblings.map { node -> String in
+                    guard let chain = ElementReachability.ancestorChain(to: node, from: rootNode)
+                    else { return "(no chain)" }
+                    return chain.dropLast().reversed()
+                        .compactMap { $0.displayName?.raw }.first ?? "(unnamed ancestors)"
+                }
+                let rolePaths = siblings.map { node -> String in
+                    guard let chain = ElementReachability.ancestorChain(to: node, from: rootNode)
+                    else { return "(no chain)" }
+                    return chain.map(\.role).joined(separator: "/")
+                }
+
+                // Disjoint frames are what makes a pointed-at location able to
+                // choose between them — the mechanism `nearPoint` uses.
+                let frames = siblings.map(\.frameInAppKitCoordinates)
+                let framesAreDisjoint = frames.enumerated().allSatisfy { index, frame in
+                    frames.enumerated().allSatisfy { otherIndex, other in
+                        index == otherIndex || !frame.intersects(other)
+                    }
+                }
+
+                // Is this one control counted twice? A wrapper and the label
+                // inside it can carry the same name and nearly the same frame,
+                // and nothing about that is an identity problem — it is one
+                // target that appears in the tree at two depths.
+                let nested = siblings.contains { outer in
+                    siblings.contains { inner in
+                        inner.depth > outer.depth
+                            && (ElementReachability.ancestorChain(to: inner, from: outer)?.count ?? 0) > 1
+                    }
+                }
+                if nested {
+                    nestedDuplicates += 1
+                    if let outer = siblings.min(by: { $0.depth < $1.depth }),
+                       let inner = siblings.max(by: { $0.depth < $1.depth }) {
+                        nestedExamples.insert("\(outer.role)>\(inner.role)")
+                    }
+                    continue
+                }
+
+                if Set(ancestorNames).count == siblings.count {
+                    separatedByAncestorName += 1
+                } else if Set(rolePaths).count == siblings.count {
+                    separatedByRolePath += 1
+                } else if framesAreDisjoint {
+                    separatedByFrame += 1
+                } else {
+                    separatedByNeither += 1
+                }
+            }
+
+            report.append("")
+            report.append("IDENTITY — what would separate the \(groups.count) names shared by more than one element?")
+            report.append("  nearest named ancestor \(separatedByAncestorName)")
+            report.append("  role path from window  \(separatedByRolePath)   (ancestors are unnamed, roles differ)")
+            report.append("  a pointed-at location  \(separatedByFrame)   (nothing structural separates them; frames are disjoint)")
+            report.append("  nothing                \(separatedByNeither)   (overlapping frames too — needs a sibling index)")
+            report.append("  not an identity problem \(nestedDuplicates)   (one control at two depths: \(nestedExamples.sorted().prefix(4).joined(separator: ", ")))")
+        }
+
         report.append("")
         report.append("REACHABILITY")
         report.append("  actionable now         \(targetable)")
