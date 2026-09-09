@@ -83,27 +83,60 @@ struct AccessibilityElementNode {
 ///
 /// A truncated tree is indistinguishable from a genuinely shallow app, so a
 /// silent cap would quietly teach us the wrong lesson about how AX behaves.
+/// Why a walk stopped early. Three unrelated causes that a single `truncated`
+/// flag would flatten into one useless bit — and the project has already paid
+/// once for a boolean sitting next to a number it invalidated.
+enum WalkStopReason: String, CaseIterable {
+    case depthLimit = "hit the depth limit"
+    case nodeLimit = "hit the node limit"
+    case timeLimit = "ran out of time"
+}
+
 struct AccessibilityWalkBudget {
     let maximumDepth: Int
     let maximumNodeCount: Int
 
-    private(set) var nodesVisited = 0
-    private(set) var wasTruncated = false
+    /// The wall-clock guard, and the only one that protects against an app we do
+    /// not control.
+    ///
+    /// Depth and node caps bound the *shape* of a tree; neither bounds a walk
+    /// against a stalled or hostile app, where a single read can block for the
+    /// full messaging timeout. Measured 2026-09-09: Mail walked 18,538 nodes in
+    /// 5.1 s at 0.275 ms/node, but its cold per-node cost was 11.22 ms — the same
+    /// tree at that rate would take over three minutes. Nothing in the node cap
+    /// would have stopped it.
+    let deadline: Date
 
-    init(maximumDepth: Int, maximumNodeCount: Int) {
+    private(set) var nodesVisited = 0
+    private(set) var stopReasons: Set<WalkStopReason> = []
+
+    /// Kept so callers that only ask "was this complete?" still work. Anything
+    /// reporting the result should print `stopReasons` instead — "it stopped" and
+    /// "it stopped because the app went unresponsive" are different facts.
+    var wasTruncated: Bool { !stopReasons.isEmpty }
+
+    init(maximumDepth: Int, maximumNodeCount: Int, timeLimitInSeconds: Double = 10.0) {
         self.maximumDepth = maximumDepth
         self.maximumNodeCount = maximumNodeCount
+        self.deadline = Date().addingTimeInterval(timeLimitInSeconds)
     }
 
     /// Returns true if a node at this depth may be visited, spending one slot.
-    /// Returns false and flags truncation when either limit is reached.
+    /// Returns false and records *which* limit stopped it.
     mutating func claimSlot(atDepth depth: Int) -> Bool {
         guard depth < maximumDepth else {
-            wasTruncated = true
+            stopReasons.insert(.depthLimit)
             return false
         }
         guard nodesVisited < maximumNodeCount else {
-            wasTruncated = true
+            stopReasons.insert(.nodeLimit)
+            return false
+        }
+        // Checked per node rather than per subtree: a walk that blows its budget
+        // does so inside one slow read, and a coarser check would sail past the
+        // deadline by exactly the amount we are trying to bound.
+        guard Date() < deadline else {
+            stopReasons.insert(.timeLimit)
             return false
         }
 
@@ -121,9 +154,23 @@ struct AccessibilityWindowSnapshot {
     let nodeCount: Int
     let deepestLevelReached: Int
     let wasTruncatedByBudget: Bool
+
+    /// Which limits stopped the walk. Empty means it finished.
+    let walkStopReasons: Set<WalkStopReason>
     let timedOutNodePaths: [String]
     let nodesWithoutReadableFrame: Int
     let subtreesLostToFailedReads: Int
+
+    /// Subtrees we chose not to walk because their root sits far outside the
+    /// window, and how many nodes that saved.
+    ///
+    /// This is a deliberate omission, not a failure, so it is reported the same
+    /// way truncation is: a count, never a silent absence. Structure's whole
+    /// claim over vision is knowing what exists off-screen — so we still say
+    /// *that* something is there and how much of it, we just do not enumerate a
+    /// message list to find one button.
+    let subtreesSkippedFarOffScreen: Int
+    let nodesSkippedFarOffScreen: Int
 
     /// True when the frontmost application changed while the walk was running.
     ///
@@ -149,6 +196,31 @@ enum AccessibilityTreeWalker {
     /// Both systems describe the same pixel; they disagree only about which
     /// way is down. Skipping this conversion does not crash — it silently
     /// mirrors every frame vertically, which is why it is unit tested.
+    /// Ask an Electron app to build its accessibility tree.
+    ///
+    /// Electron gates tree construction behind `AXManualAccessibility` so that
+    /// the cost is only paid when an assistive client actually asks. Until it is
+    /// set, the app answers with a near-empty tree — which reads exactly like an
+    /// app with no accessibility support, and is why our first Electron
+    /// measurements were wrong.
+    ///
+    /// **Set it blind.** The attribute deliberately does not appear in
+    /// `AXUIElementCopyAttributeNames` or Accessibility Inspector, so probing for
+    /// it first will always say unsupported. A failure here is information, not
+    /// an error: native apps have no such attribute and return
+    /// `kAXErrorAttributeUnsupported`, which tells us the app was never gated.
+    ///
+    /// Deliberately NOT `AXEnhancedUserInterface`, which is Chrome's equivalent
+    /// switch and is documented to break window positioning for window managers.
+    @discardableResult
+    static func requestManualAccessibility(from applicationElement: AXUIElement) -> AXError {
+        AXUIElementSetAttributeValue(
+            applicationElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        )
+    }
+
     static func convertAccessibilityFrameToAppKitFrame(
         _ accessibilityFrame: CGRect,
         primaryDisplayHeightInPoints: CGFloat
@@ -219,8 +291,8 @@ enum AccessibilityTreeWalker {
     /// Fine for the dump runner; move to a background actor if the overlay
     /// ever needs to walk while the UI stays responsive.
     static func snapshotFocusedWindow(
-        maximumDepth: Int = 25,
-        maximumNodeCount: Int = 2000
+        maximumDepth: Int = 120,
+        maximumNodeCount: Int = 25_000
     ) throws -> AccessibilityWindowSnapshot {
         guard AXIsProcessTrusted() else {
             throw AccessibilitySnapshotError.accessibilityPermissionNotGranted
@@ -239,11 +311,69 @@ enum AccessibilityTreeWalker {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)
 
         let applicationElement = AXUIElementCreateApplication(frontmostApplication.processIdentifier)
+        // A native app has no such attribute and answers kAXErrorAttributeUnsupported
+        // (-25205) — that is the "you were never gated" reply, not a failure. Only an
+        // app that accepted it was building its tree on demand, and only that app
+        // needs a moment to build one, so nothing else pays for this.
+        // --ax-no-manual isolates the two variables: this session found a huge
+        // Electron result and needs to know whether it came from the attribute or
+        // from raising the depth budget.
+        let manualAccessibilityResult = CommandLine.arguments.contains("--ax-no-manual")
+            ? AXError.attributeUnsupported
+            : requestManualAccessibility(from: applicationElement)
+        let wasGatedApp = manualAccessibilityResult == .success
 
-        guard let focusedWindowElement = copyElementAttribute(
+        // A gated app has to *construct* its tree after saying yes, and it does not
+        // announce when it is done. Measured 2026-09-09: Cursor accepts the
+        // attribute and still has no focused window 250 ms later, so a single sleep
+        // reads as "this app has no window" — the same silent-zero mistake in a new
+        // costume. Retry until the window appears instead of guessing a duration.
+        var focusedWindowElement = copyElementAttribute(
             from: applicationElement,
             attribute: kAXFocusedWindowAttribute
-        ) else {
+        )
+        if wasGatedApp {
+            var attemptsRemaining = 20   // 20 x 100 ms = 2 s ceiling
+            while focusedWindowElement == nil, attemptsRemaining > 0 {
+                Thread.sleep(forTimeInterval: 0.1)
+                focusedWindowElement = copyElementAttribute(
+                    from: applicationElement,
+                    attribute: kAXFocusedWindowAttribute
+                )
+                attemptsRemaining -= 1
+            }
+            print("🔓 AXManualAccessibility accepted by \(frontmostApplication.localizedName ?? "?") — window after \((20 - attemptsRemaining) * 100) ms")
+        } else {
+            print("🔒 not gated (AXError \(manualAccessibilityResult.rawValue)) — native app, tree was always there")
+        }
+
+        // AXFocusedWindow is not universal. Fall back through the other two window
+        // attributes before concluding there is no window, and print what the app
+        // actually publishes so a failure names its own cause instead of guessing.
+        if focusedWindowElement == nil {
+            focusedWindowElement = copyElementAttribute(
+                from: applicationElement,
+                attribute: kAXMainWindowAttribute
+            )
+            if focusedWindowElement != nil { print("   ↳ no AXFocusedWindow; used AXMainWindow") }
+        }
+        if focusedWindowElement == nil {
+            var windowsValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                applicationElement, kAXWindowsAttribute as CFString, &windowsValue
+            ) == .success,
+               let windows = windowsValue as? [AXUIElement], let first = windows.first {
+                focusedWindowElement = first
+                print("   ↳ no AXFocusedWindow/AXMainWindow; used AXWindows[0] of \(windows.count)")
+            }
+        }
+        if focusedWindowElement == nil {
+            var names: CFArray?
+            AXUIElementCopyAttributeNames(applicationElement, &names)
+            print("   ↳ application element publishes: \((names as? [String] ?? []).joined(separator: ", "))")
+        }
+
+        guard let focusedWindowElement else {
             throw AccessibilitySnapshotError.noFocusedWindow
         }
 
@@ -259,6 +389,29 @@ enum AccessibilityTreeWalker {
         var timedOutNodePaths: [String] = []
         var nodesWithoutReadableFrame = 0
         var subtreesLostToFailedReads = 0
+        var subtreesSkippedFarOffScreen = 0
+        var nodesSkippedFarOffScreen = 0
+
+        // How far off-screen still counts as reachable.
+        //
+        // Measured 2026-09-09: Mail's window shows 122 elements while the tree
+        // holds 4,000 — 424 subtrees are rooted outside the window, carrying
+        // 3,454 descendants. Those are message-list rows, an index rather than a
+        // set of targets. But "Storage Settings…" sat 130 points below the fold
+        // and WAS a target, so the boundary cannot be the window edge itself.
+        // One window-height of margin on every side keeps anything a scroll or
+        // two away inside the tree by construction rather than by luck.
+        var windowFrameValue: CFTypeRef?
+        AXUIElementCopyAttributeValue(focusedWindowElement, "AXFrame" as CFString, &windowFrameValue)
+        var windowRect = CGRect.zero
+        if let windowFrameValue, CFGetTypeID(windowFrameValue) == AXValueGetTypeID() {
+            AXValueGetValue(windowFrameValue as! AXValue, .cgRect, &windowRect)
+        }
+        let reachableArea: CGRect? = windowRect.isEmpty
+            ? nil
+            : convertAccessibilityFrameToAppKitFrame(
+                windowRect, primaryDisplayHeightInPoints: primaryDisplayHeightInPoints
+              ).insetBy(dx: -windowRect.width, dy: -windowRect.height)
 
         let walkStartedAt = Date()
         let rootNode = buildNode(
@@ -269,7 +422,10 @@ enum AccessibilityTreeWalker {
             deepestLevelReached: &deepestLevelReached,
             timedOutNodePaths: &timedOutNodePaths,
             nodesWithoutReadableFrame: &nodesWithoutReadableFrame,
-            subtreesLostToFailedReads: &subtreesLostToFailedReads
+            subtreesLostToFailedReads: &subtreesLostToFailedReads,
+            reachableArea: reachableArea,
+            subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
+            nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen
         )
         let walkDurationInSeconds = Date().timeIntervalSince(walkStartedAt)
 
@@ -287,11 +443,106 @@ enum AccessibilityTreeWalker {
             nodeCount: budget.nodesVisited,
             deepestLevelReached: deepestLevelReached,
             wasTruncatedByBudget: budget.wasTruncated,
+            walkStopReasons: budget.stopReasons,
             timedOutNodePaths: timedOutNodePaths,
             nodesWithoutReadableFrame: nodesWithoutReadableFrame,
             subtreesLostToFailedReads: subtreesLostToFailedReads,
+            subtreesSkippedFarOffScreen: subtreesSkippedFarOffScreen,
+            nodesSkippedFarOffScreen: nodesSkippedFarOffScreen,
             focusChangedDuringWalk: focusChangedDuringWalk
         )
+    }
+
+    // MARK: - Batched reads
+
+    /// The seven attributes every node needs, asked for in one call.
+    ///
+    /// The walker used to make nine separate cross-process round trips per node:
+    /// five strings, position, size, children, and the action list. Measured
+    /// 2026-09-09 with `scripts/ax-read-benchmark.swift`, batching is worth ~2.5x
+    /// — and notably NOT 9x. Collapsing round trips does not divide the cost,
+    /// because the expense is the target app answering, not the transport. That
+    /// is also why the gain is nearly identical across very different apps.
+    ///
+    /// `AXActionNames` is a separate API rather than an attribute, so it cannot
+    /// join the batch. Nine trips become two.
+    private static let batchedAttributeNames: [String] = [
+        kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute,
+        kAXValueAttribute, kAXDescriptionAttribute, "AXFrame", kAXChildrenAttribute
+    ]
+
+    private struct BatchedNodeRead {
+        var role: String?
+        var subrole: String?
+        var title: String?
+        var value: String?
+        var elementDescription: String?
+        var frame: CGRect?
+        var children: [AXUIElement] = []
+        var childReadFailed = false
+        var frameDidTimeOut = false
+    }
+
+    /// A failed entry inside a batched result comes back as an `AXValue` wrapping
+    /// an `AXError`, not as a missing element — so "the app has no children" and
+    /// "the children read failed" are still distinguishable, which the walker
+    /// depends on. Returns nil only when the batch call itself failed, so the
+    /// caller can fall back to individual reads.
+    private static func batchedRead(from element: AXUIElement) -> BatchedNodeRead? {
+        var rawValues: CFArray?
+        let result = AXUIElementCopyMultipleAttributeValues(
+            element,
+            batchedAttributeNames as CFArray,
+            AXCopyMultipleAttributeOptions(),   // never .stopOnError: one bad attribute must not lose the rest
+            &rawValues
+        )
+        guard result == .success,
+              let values = rawValues as? [AnyObject],
+              values.count == batchedAttributeNames.count else {
+            return nil
+        }
+
+        func errorCode(at index: Int) -> AXError? {
+            let entry = values[index]
+            guard CFGetTypeID(entry) == AXValueGetTypeID() else { return nil }
+            let axValue = entry as! AXValue
+            guard AXValueGetType(axValue) == .axError else { return nil }
+            var code = AXError.success
+            guard AXValueGetValue(axValue, .axError, &code) else { return nil }
+            return code
+        }
+
+        func string(at index: Int) -> String? {
+            guard errorCode(at: index) == nil,
+                  let text = values[index] as? String, !text.isEmpty else { return nil }
+            return text
+        }
+
+        var read = BatchedNodeRead()
+        read.role = string(at: 0)
+        read.subrole = string(at: 1)
+        read.title = string(at: 2)
+        read.value = string(at: 3)
+        read.elementDescription = string(at: 4)
+
+        if errorCode(at: 5) == nil, CFGetTypeID(values[5]) == AXValueGetTypeID() {
+            let axValue = values[5] as! AXValue
+            var rect = CGRect.zero
+            if AXValueGetType(axValue) == .cgRect, AXValueGetValue(axValue, .cgRect, &rect) {
+                read.frame = rect
+            }
+        } else if errorCode(at: 5) == .cannotComplete {
+            read.frameDidTimeOut = true
+        }
+
+        if let childError = errorCode(at: 6) {
+            // Same rule as the unbatched path: these two mean "genuinely empty".
+            read.childReadFailed = !(childError == .noValue || childError == .attributeUnsupported)
+        } else if let kids = values[6] as? [AXUIElement] {
+            read.children = kids
+        }
+
+        return read
     }
 
     private static func buildNode(
@@ -302,19 +553,39 @@ enum AccessibilityTreeWalker {
         deepestLevelReached: inout Int,
         timedOutNodePaths: inout [String],
         nodesWithoutReadableFrame: inout Int,
-        subtreesLostToFailedReads: inout Int
+        subtreesLostToFailedReads: inout Int,
+        reachableArea: CGRect?,
+        subtreesSkippedFarOffScreen: inout Int,
+        nodesSkippedFarOffScreen: inout Int
     ) -> AccessibilityElementNode? {
         guard budget.claimSlot(atDepth: depth) else { return nil }
 
         deepestLevelReached = max(deepestLevelReached, depth)
 
-        let role = copyStringAttribute(from: element, attribute: kAXRoleAttribute) ?? "AXUnknown"
-        let subrole = copyStringAttribute(from: element, attribute: kAXSubroleAttribute)
-        let title = copyStringAttribute(from: element, attribute: kAXTitleAttribute)
-        let value = copyStringAttribute(from: element, attribute: kAXValueAttribute)
-        let elementDescription = copyStringAttribute(from: element, attribute: kAXDescriptionAttribute)
+        // One batched call for all seven attributes; the individual reads remain as
+        // the fallback for any app that refuses the batched API.
+        let batched = batchedRead(from: element)
 
-        let frameReadResult = copyFrame(from: element)
+        let role = batched?.role
+            ?? copyStringAttribute(from: element, attribute: kAXRoleAttribute)
+            ?? "AXUnknown"
+        let subrole = batched?.subrole ?? copyStringAttribute(from: element, attribute: kAXSubroleAttribute)
+        let title = batched?.title ?? copyStringAttribute(from: element, attribute: kAXTitleAttribute)
+        let value = batched?.value ?? copyStringAttribute(from: element, attribute: kAXValueAttribute)
+        let elementDescription = batched?.elementDescription
+            ?? copyStringAttribute(from: element, attribute: kAXDescriptionAttribute)
+
+        // AXFrame is not an SDK constant and not every app publishes it, so fall
+        // back to position + size rather than reporting a frameless node.
+        let frameReadResult: (frame: CGRect?, didTimeOut: Bool)
+        if let batched, batched.frame != nil {
+            frameReadResult = (batched.frame, false)
+        } else if let batched, batched.frameDidTimeOut {
+            frameReadResult = (nil, true)
+        } else {
+            frameReadResult = copyFrame(from: element)
+        }
+
         if frameReadResult.didTimeOut {
             timedOutNodePaths.append("\(role) at depth \(depth)")
         } else if frameReadResult.frame == nil {
@@ -327,12 +598,27 @@ enum AccessibilityTreeWalker {
         )
 
         var childNodes: [AccessibilityElementNode] = []
-        let childReadResult = copyChildElements(from: element)
+        let childReadResult = batched.map { (children: $0.children, readFailed: $0.childReadFailed) }
+            ?? copyChildElements(from: element)
         if childReadResult.readFailed {
             subtreesLostToFailedReads += 1
         }
 
-        for childElement in childReadResult.children {
+        // Stop descending when this node sits far outside the window. A
+        // zero-area frame is NOT "outside" — it is the meaningless-value case,
+        // and its children may still be real, so it is excluded from this test.
+        let isFarOffScreen: Bool = {
+            guard let reachableArea, depth > 0,
+                  appKitFrame.width > 0, appKitFrame.height > 0 else { return false }
+            return !appKitFrame.intersects(reachableArea)
+        }()
+
+        if isFarOffScreen, !childReadResult.children.isEmpty {
+            subtreesSkippedFarOffScreen += 1
+            nodesSkippedFarOffScreen += childReadResult.children.count
+        }
+
+        for childElement in isFarOffScreen ? [] : childReadResult.children {
             guard let childNode = buildNode(
                 from: childElement,
                 depth: depth + 1,
@@ -341,13 +627,29 @@ enum AccessibilityTreeWalker {
                 deepestLevelReached: &deepestLevelReached,
                 timedOutNodePaths: &timedOutNodePaths,
                 nodesWithoutReadableFrame: &nodesWithoutReadableFrame,
-                subtreesLostToFailedReads: &subtreesLostToFailedReads
+                subtreesLostToFailedReads: &subtreesLostToFailedReads,
+                reachableArea: reachableArea,
+                subtreesSkippedFarOffScreen: &subtreesSkippedFarOffScreen,
+                nodesSkippedFarOffScreen: &nodesSkippedFarOffScreen
             ) else { break }
 
             childNodes.append(childNode)
         }
 
-        let publishedActionNames = copyActionNames(from: element)
+        // Skip the action read where it cannot change the answer.
+        //
+        // `isActionable` requires a displayName AND a non-zero frame AND a
+        // published action. A node failing either of the first two can never be
+        // actionable, so its action list is bought and discarded. Measured
+        // 2026-09-09: AXUIElementCopyActionNames is a separate API that cannot
+        // join the batched read and costs 1.45 ms/node in Mail — 46% of the
+        // per-node total, which is exactly why batching the other seven
+        // attributes only bought 1.37x.
+        let couldEverBeActionable = (title ?? elementDescription ?? value) != nil
+            && appKitFrame.width > 0 && appKitFrame.height > 0
+        let publishedActionNames = couldEverBeActionable
+            ? copyActionNames(from: element)
+            : []
 
         return AccessibilityElementNode(
             role: role,
