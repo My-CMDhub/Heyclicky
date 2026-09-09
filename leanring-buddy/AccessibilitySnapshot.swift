@@ -377,6 +377,98 @@ enum AccessibilityTreeWalker {
         )
     }
 
+    // MARK: - Batched reads
+
+    /// The seven attributes every node needs, asked for in one call.
+    ///
+    /// The walker used to make nine separate cross-process round trips per node:
+    /// five strings, position, size, children, and the action list. Measured
+    /// 2026-09-09 with `scripts/ax-read-benchmark.swift`, batching is worth ~2.5x
+    /// — and notably NOT 9x. Collapsing round trips does not divide the cost,
+    /// because the expense is the target app answering, not the transport. That
+    /// is also why the gain is nearly identical across very different apps.
+    ///
+    /// `AXActionNames` is a separate API rather than an attribute, so it cannot
+    /// join the batch. Nine trips become two.
+    private static let batchedAttributeNames: [String] = [
+        kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute,
+        kAXValueAttribute, kAXDescriptionAttribute, "AXFrame", kAXChildrenAttribute
+    ]
+
+    private struct BatchedNodeRead {
+        var role: String?
+        var subrole: String?
+        var title: String?
+        var value: String?
+        var elementDescription: String?
+        var frame: CGRect?
+        var children: [AXUIElement] = []
+        var childReadFailed = false
+        var frameDidTimeOut = false
+    }
+
+    /// A failed entry inside a batched result comes back as an `AXValue` wrapping
+    /// an `AXError`, not as a missing element — so "the app has no children" and
+    /// "the children read failed" are still distinguishable, which the walker
+    /// depends on. Returns nil only when the batch call itself failed, so the
+    /// caller can fall back to individual reads.
+    private static func batchedRead(from element: AXUIElement) -> BatchedNodeRead? {
+        var rawValues: CFArray?
+        let result = AXUIElementCopyMultipleAttributeValues(
+            element,
+            batchedAttributeNames as CFArray,
+            AXCopyMultipleAttributeOptions(),   // never .stopOnError: one bad attribute must not lose the rest
+            &rawValues
+        )
+        guard result == .success,
+              let values = rawValues as? [AnyObject],
+              values.count == batchedAttributeNames.count else {
+            return nil
+        }
+
+        func errorCode(at index: Int) -> AXError? {
+            let entry = values[index]
+            guard CFGetTypeID(entry) == AXValueGetTypeID() else { return nil }
+            let axValue = entry as! AXValue
+            guard AXValueGetType(axValue) == .axError else { return nil }
+            var code = AXError.success
+            guard AXValueGetValue(axValue, .axError, &code) else { return nil }
+            return code
+        }
+
+        func string(at index: Int) -> String? {
+            guard errorCode(at: index) == nil,
+                  let text = values[index] as? String, !text.isEmpty else { return nil }
+            return text
+        }
+
+        var read = BatchedNodeRead()
+        read.role = string(at: 0)
+        read.subrole = string(at: 1)
+        read.title = string(at: 2)
+        read.value = string(at: 3)
+        read.elementDescription = string(at: 4)
+
+        if errorCode(at: 5) == nil, CFGetTypeID(values[5]) == AXValueGetTypeID() {
+            let axValue = values[5] as! AXValue
+            var rect = CGRect.zero
+            if AXValueGetType(axValue) == .cgRect, AXValueGetValue(axValue, .cgRect, &rect) {
+                read.frame = rect
+            }
+        } else if errorCode(at: 5) == .cannotComplete {
+            read.frameDidTimeOut = true
+        }
+
+        if let childError = errorCode(at: 6) {
+            // Same rule as the unbatched path: these two mean "genuinely empty".
+            read.childReadFailed = !(childError == .noValue || childError == .attributeUnsupported)
+        } else if let kids = values[6] as? [AXUIElement] {
+            read.children = kids
+        }
+
+        return read
+    }
+
     private static func buildNode(
         from element: AXUIElement,
         depth: Int,
@@ -391,13 +483,30 @@ enum AccessibilityTreeWalker {
 
         deepestLevelReached = max(deepestLevelReached, depth)
 
-        let role = copyStringAttribute(from: element, attribute: kAXRoleAttribute) ?? "AXUnknown"
-        let subrole = copyStringAttribute(from: element, attribute: kAXSubroleAttribute)
-        let title = copyStringAttribute(from: element, attribute: kAXTitleAttribute)
-        let value = copyStringAttribute(from: element, attribute: kAXValueAttribute)
-        let elementDescription = copyStringAttribute(from: element, attribute: kAXDescriptionAttribute)
+        // One batched call for all seven attributes; the individual reads remain as
+        // the fallback for any app that refuses the batched API.
+        let batched = batchedRead(from: element)
 
-        let frameReadResult = copyFrame(from: element)
+        let role = batched?.role
+            ?? copyStringAttribute(from: element, attribute: kAXRoleAttribute)
+            ?? "AXUnknown"
+        let subrole = batched?.subrole ?? copyStringAttribute(from: element, attribute: kAXSubroleAttribute)
+        let title = batched?.title ?? copyStringAttribute(from: element, attribute: kAXTitleAttribute)
+        let value = batched?.value ?? copyStringAttribute(from: element, attribute: kAXValueAttribute)
+        let elementDescription = batched?.elementDescription
+            ?? copyStringAttribute(from: element, attribute: kAXDescriptionAttribute)
+
+        // AXFrame is not an SDK constant and not every app publishes it, so fall
+        // back to position + size rather than reporting a frameless node.
+        let frameReadResult: (frame: CGRect?, didTimeOut: Bool)
+        if let batched, batched.frame != nil {
+            frameReadResult = (batched.frame, false)
+        } else if let batched, batched.frameDidTimeOut {
+            frameReadResult = (nil, true)
+        } else {
+            frameReadResult = copyFrame(from: element)
+        }
+
         if frameReadResult.didTimeOut {
             timedOutNodePaths.append("\(role) at depth \(depth)")
         } else if frameReadResult.frame == nil {
@@ -410,7 +519,8 @@ enum AccessibilityTreeWalker {
         )
 
         var childNodes: [AccessibilityElementNode] = []
-        let childReadResult = copyChildElements(from: element)
+        let childReadResult = batched.map { (children: $0.children, readFailed: $0.childReadFailed) }
+            ?? copyChildElements(from: element)
         if childReadResult.readFailed {
             subtreesLostToFailedReads += 1
         }
@@ -430,7 +540,20 @@ enum AccessibilityTreeWalker {
             childNodes.append(childNode)
         }
 
-        let publishedActionNames = copyActionNames(from: element)
+        // Skip the action read where it cannot change the answer.
+        //
+        // `isActionable` requires a displayName AND a non-zero frame AND a
+        // published action. A node failing either of the first two can never be
+        // actionable, so its action list is bought and discarded. Measured
+        // 2026-09-09: AXUIElementCopyActionNames is a separate API that cannot
+        // join the batched read and costs 1.45 ms/node in Mail — 46% of the
+        // per-node total, which is exactly why batching the other seven
+        // attributes only bought 1.37x.
+        let couldEverBeActionable = (title ?? elementDescription ?? value) != nil
+            && appKitFrame.width > 0 && appKitFrame.height > 0
+        let publishedActionNames = couldEverBeActionable
+            ? copyActionNames(from: element)
+            : []
 
         return AccessibilityElementNode(
             role: role,
