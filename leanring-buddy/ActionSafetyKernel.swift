@@ -32,11 +32,68 @@ enum ActionSafetyKernel {
     /// itself cannot activate anything else.
     static let navigationalSelectRoles: Set<String> = ["AXRow", "AXCell", "AXStaticText"]
 
+    /// The only roles that may be typed into. Everything else is refused, not
+    /// asked about: a role that does not accept text has no correct answer to
+    /// "type this here", so there is nothing for a human to confirm.
+    static let typeableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
+
+    /// The one refusal in this kernel that has no confirmed path past it.
+    static let secureFieldSubrole = "AXSecureTextField"
+
     static func navigationalRoles(for action: ElementAction) -> Set<String> {
         switch action {
         case .press: return navigationalPressRoles
         case .select: return navigationalSelectRoles
+        case .type: return typeableRoles
         }
+    }
+
+    /// What the kernel needs to know about a typing target that the tree walk
+    /// does not carry: what the element says it will let us write, how much text
+    /// is already in it, and whether we aimed at it by name or by focus.
+    ///
+    /// Measured on the live element, one element only — this is four extra IPC
+    /// reads on the resolved target, never a per-node cost on the walk.
+    struct TypingContext: Equatable {
+        let mode: TypeMode
+        /// The subset of `AccessibilityTypePerformer.probedAttributes` the
+        /// element reported as settable. Asked, because a role is a convention.
+        let settableAttributes: Set<String>
+        let currentValueLength: Int
+        /// True when the target came from `kAXFocusedUIElement` rather than from
+        /// a name. The name checks below are then meaningless — System Settings'
+        /// search field has no name at all, and the OS, not the app's text, is
+        /// what identified it.
+        let aimedByFocus: Bool
+    }
+
+    static func secureFieldRefusalReason(subrole: String) -> String {
+        "refusing to type into a secure field (subrole \(subrole)) — the agent does not enter credentials, and this refusal has no confirmed path past it"
+    }
+
+    /// Whether a refusal says something tried to do a thing it should not, as
+    /// opposed to a thing it could not.
+    ///
+    /// The distinction is what keeps the flight recorder useful. An off-screen
+    /// or wrong-role target is the policy working normally and the audit line
+    /// explains it completely. A secure field or a label that is not a label is
+    /// the shape of an attempt, and that is exactly when the previous twenty
+    /// requests are worth having on disk.
+    static func isSecurityRefusal(reason: String) -> Bool {
+        reason == implausibleNameRefusalReason
+            || reason.hasPrefix("refusing to type into a secure field")
+    }
+
+    static func nonTextRoleRefusalReason(role: String) -> String {
+        "role \(role) does not accept text — only \(typeableRoles.sorted().joined(separator: ", ")) may be typed into"
+    }
+
+    static func missingSettableAttributeRefusalReason(attribute: String) -> String {
+        "element does not publish a settable \(attribute)"
+    }
+
+    static func replaceWouldDiscardReason(characterCount: Int) -> String {
+        "replace would discard \(characterCount) characters already in the field"
     }
 
     /// Words that make an action worth asking about regardless of role.
@@ -59,9 +116,19 @@ enum ActionSafetyKernel {
         intent: ElementActionIntent,
         resolvedNode: AccessibilityElementNode,
         matchCount: Int,
-        visibleBounds: CGRect
+        visibleBounds: CGRect,
+        typing: TypingContext? = nil
     ) -> SafetyDecision {
         // Order matters. Every refusal is checked before any permission.
+
+        // Before everything, including whether the element is even reachable:
+        // a password field is refused on sight. There is no state of the world
+        // and no `confirmed: true` that makes this an allow, so it is not a
+        // question — it is the one rule this kernel may not be argued out of.
+        if case .type = intent.action,
+           let subrole = resolvedNode.subrole, subrole == secureFieldSubrole {
+            return .refuse(reason: secureFieldRefusalReason(subrole: subrole))
+        }
 
         guard matchCount == 1 else {
             return .refuse(reason: "\(matchCount) elements match that title")
@@ -91,16 +158,47 @@ enum ActionSafetyKernel {
             }
         }
 
-        guard let name = resolvedNode.displayName, name.isPlausibleControlLabel else {
-            return .refuse(reason: implausibleNameRefusalReason)
+        if case .type = intent.action {
+            guard typeableRoles.contains(resolvedNode.role) else {
+                return .refuse(reason: nonTextRoleRefusalReason(role: resolvedNode.role))
+            }
+            // No context means nobody asked the element anything, which is our
+            // bug and not a question for a human.
+            guard let typing else {
+                return .refuse(reason: "no typing context was gathered for this element")
+            }
+            // The role said "text field". This is the element itself agreeing.
+            let required = typing.mode.settableAttributeRequired
+            guard typing.settableAttributes.contains(required) else {
+                return .refuse(reason: missingSettableAttributeRefusalReason(attribute: required))
+            }
         }
 
-        // App-written text may only ever make the decision *more* cautious.
-        // A keyword here escalates to a question; nothing an app publishes can
-        // turn a question into an allow.
-        let lowercasedTitle = name.raw.lowercased()
-        if let matchedKeyword = destructiveTitleKeywords.first(where: { lowercasedTitle.contains($0) }) {
-            return .requireConfirmation(reason: "title suggests a destructive action: \(matchedKeyword)")
+        // A field aimed at by focus is identified by the OS, not by its name —
+        // and the fields that most need typing are anonymous. Measured
+        // 2026-09-10: System Settings' search field publishes no title, no
+        // description and an empty value.
+        if typing?.aimedByFocus != true {
+            guard let name = resolvedNode.displayName, name.isPlausibleControlLabel else {
+                return .refuse(reason: implausibleNameRefusalReason)
+            }
+
+            // App-written text may only ever make the decision *more* cautious.
+            // A keyword here escalates to a question; nothing an app publishes can
+            // turn a question into an allow.
+            let lowercasedTitle = name.raw.lowercased()
+            if let matchedKeyword = destructiveTitleKeywords.first(where: { lowercasedTitle.contains($0) }) {
+                return .requireConfirmation(reason: "title suggests a destructive action: \(matchedKeyword)")
+            }
+        }
+
+        // Overwriting a document is the worst thing this verb can do, and it is
+        // silent — the old text is simply gone. Replacing an *empty* field is
+        // not destruction, so it is not asked about.
+        if let typing, typing.mode == .replace, typing.currentValueLength > 0 {
+            return .requireConfirmation(
+                reason: replaceWouldDiscardReason(characterCount: typing.currentValueLength)
+            )
         }
 
         guard navigationalRoles(for: intent.action).contains(resolvedNode.role) else {

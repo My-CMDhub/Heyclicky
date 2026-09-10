@@ -883,6 +883,8 @@ private func windowContaining(_ children: [AccessibilityElementNode]) -> Accessi
         // App-facing text a caller supplied. A raw newline here would otherwise
         // write a second, fictitious record into an append-only log.
         target: "Sound\nrefused",
+        app: "com.apple.systempreferences",
+        session: "A1B2C3D4",
         dryRun: false,
         confirmed: true,
         kernel: "requireConfirmation",
@@ -907,10 +909,352 @@ private func windowContaining(_ children: [AccessibilityElementNode]) -> Accessi
 
     // A refused request leaves nothing else behind, so it is logged the same
     // shape as one that ran.
+    // The two fields that make an old log readable: which app the line acted
+    // on, and which run of the harness wrote it.
+    #expect(parsed["app"] as? String == "com.apple.systempreferences")
+    #expect(parsed["session"] as? String == "A1B2C3D4")
+
     let refused = HarnessPolicy.auditLine(
         at: Date(timeIntervalSince1970: 0), id: "", verb: "?", target: nil,
+        app: nil, session: "A1B2C3D4",
         dryRun: false, confirmed: false, kernel: "n/a",
         outcome: "unknownVerb", milliseconds: 0
     )
     #expect(refused.contains("\"outcome\":\"unknownVerb\""))
+}
+
+// MARK: - Typing: the refusals
+//
+// The cross-process half of `type` — the write, the read-back, the focused
+// element — is proven by the live transcript. What a unit test can honestly
+// prove is what the kernel decides once someone has asked the element the four
+// questions, so these hand-build the answers.
+//
+// The secure-field refusal is proven HERE AND NOWHERE ELSE: there is
+// deliberately no live password field in this project's evidence, because
+// pointing an agent at one to watch it decline is not a test worth running.
+
+private func typingNode(
+    role: String,
+    subrole: String? = nil,
+    name: String? = "Search",
+    frame: CGRect = CGRect(x: 100, y: 100, width: 200, height: 24)
+) -> AccessibilityElementNode {
+    AccessibilityElementNode(
+        role: role,
+        subrole: subrole,
+        title: name,
+        value: nil,
+        frameInAppKitCoordinates: frame,
+        depth: 2,
+        children: []
+    )
+}
+
+private let wholeScreen = CGRect(x: 0, y: 0, width: 1920, height: 1200)
+
+@Test func aSecureFieldIsRefusedAndNoConfirmationBuysPastIt() async throws {
+    let decision = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Password", action: .type),
+        resolvedNode: typingNode(role: "AXTextField", subrole: "AXSecureTextField", name: "Password"),
+        matchCount: 1,
+        visibleBounds: wholeScreen,
+        typing: ActionSafetyKernel.TypingContext(
+            mode: .replace,
+            // Every attribute settable, a perfect frame, a plausible name — the
+            // element is entirely willing. The subrole is the whole decision.
+            settableAttributes: ["AXValue", "AXSelectedText", "AXSelectedTextRange", "AXFocused"],
+            currentValueLength: 0,
+            aimedByFocus: false
+        )
+    )
+
+    #expect(decision == .refuse(
+        reason: ActionSafetyKernel.secureFieldRefusalReason(subrole: "AXSecureTextField")
+    ))
+    // A refusal, not a question: `confirmed: true` cannot execute it.
+    #expect(HarnessPolicy.executability(of: decision, confirmed: true).executable == false)
+}
+
+@Test func aRoleThatDoesNotAcceptTextIsRefusedRatherThanAskedAbout() async throws {
+    let decision = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "About", action: .type),
+        resolvedNode: typingNode(role: "AXButton", name: "About"),
+        matchCount: 1,
+        visibleBounds: wholeScreen,
+        typing: ActionSafetyKernel.TypingContext(
+            mode: .insert,
+            settableAttributes: ["AXValue", "AXSelectedText"],
+            currentValueLength: 0,
+            aimedByFocus: false
+        )
+    )
+
+    // There is no correct answer to "type this into a button", so there is
+    // nothing for a human to confirm.
+    #expect(decision == .refuse(reason: ActionSafetyKernel.nonTextRoleRefusalReason(role: "AXButton")))
+}
+
+@Test func aTextRoleThatWillNotAcceptTheWriteIsRefusedByName() async throws {
+    // Role says text field. The element says it will not accept AXSelectedText,
+    // which is what an insert writes — a role is a convention, this is a fact.
+    let decision = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Search", action: .type),
+        resolvedNode: typingNode(role: "AXTextField"),
+        matchCount: 1,
+        visibleBounds: wholeScreen,
+        typing: ActionSafetyKernel.TypingContext(
+            mode: .insert,
+            settableAttributes: ["AXValue"],
+            currentValueLength: 0,
+            aimedByFocus: false
+        )
+    )
+
+    #expect(decision == .refuse(
+        reason: ActionSafetyKernel.missingSettableAttributeRefusalReason(attribute: "AXSelectedText")
+    ))
+}
+
+@Test func replacingTextThatIsAlreadyThereAsksFirstAndSaysHowMuch() async throws {
+    func decide(currentValueLength: Int) -> SafetyDecision {
+        ActionSafetyKernel.evaluate(
+            intent: ElementActionIntent(role: nil, title: "Untitled", action: .type),
+            resolvedNode: typingNode(role: "AXTextArea", name: "Untitled"),
+            matchCount: 1,
+            visibleBounds: wholeScreen,
+            typing: ActionSafetyKernel.TypingContext(
+                mode: .replace,
+                settableAttributes: ["AXValue", "AXSelectedText"],
+                currentValueLength: currentValueLength,
+                aimedByFocus: false
+            )
+        )
+    }
+
+    // Writing AXValue replaces the WHOLE field. Doing that silently to a
+    // document is the worst thing this verb can do, so the count is in the
+    // reason — "4213 characters" is a sentence a human can answer.
+    #expect(decide(currentValueLength: 4213)
+        == .requireConfirmation(reason: ActionSafetyKernel.replaceWouldDiscardReason(characterCount: 4213)))
+
+    // An empty field has nothing to discard, so there is nothing to ask.
+    #expect(decide(currentValueLength: 0) == .allow)
+}
+
+@Test func anAnonymousFieldAimedAtByFocusIsNotRefusedForHavingNoName() async throws {
+    // System Settings' search field: no title, no description, empty value.
+    // The name checks are meaningless when the OS, not the app's text, said
+    // which element this is.
+    let anonymous = typingNode(role: "AXTextField", subrole: "AXSearchField", name: nil)
+    let context = { (aimedByFocus: Bool) in
+        ActionSafetyKernel.TypingContext(
+            mode: .insert,
+            settableAttributes: ["AXValue", "AXSelectedText", "AXSelectedTextRange", "AXFocused"],
+            currentValueLength: 0,
+            aimedByFocus: aimedByFocus
+        )
+    }
+    let intent = ElementActionIntent(role: nil, title: "", action: .type)
+
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent, resolvedNode: anonymous, matchCount: 1,
+        visibleBounds: wholeScreen, typing: context(true)
+    ) == .allow)
+
+    // Aimed at by name, the same nameless element is refused — because then the
+    // name is the identity we acted on and there wasn't one.
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent, resolvedNode: anonymous, matchCount: 1,
+        visibleBounds: wholeScreen, typing: context(false)
+    ) == .refuse(reason: ActionSafetyKernel.implausibleNameRefusalReason))
+}
+
+@Test func typingStillObeysTheRefusalsEveryOtherVerbObeys() async throws {
+    let context = ActionSafetyKernel.TypingContext(
+        mode: .insert,
+        settableAttributes: ["AXValue", "AXSelectedText"],
+        currentValueLength: 0,
+        aimedByFocus: true
+    )
+    let intent = ElementActionIntent(role: nil, title: "", action: .type)
+
+    // Zero area: a successful read of a meaningless value.
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent,
+        resolvedNode: typingNode(role: "AXTextField", frame: .zero),
+        matchCount: 1, visibleBounds: wholeScreen, typing: context
+    ) == .refuse(reason: ActionSafetyKernel.zeroAreaRefusalReason))
+
+    // Scrolled out of the window: named, sized, and not on screen.
+    #expect(ActionSafetyKernel.evaluate(
+        intent: intent,
+        resolvedNode: typingNode(role: "AXTextField", frame: CGRect(x: 20, y: -400, width: 200, height: 24)),
+        matchCount: 1, visibleBounds: wholeScreen, typing: context
+    ) == .refuse(reason: ActionSafetyKernel.outsideBoundsRefusalReason))
+}
+
+// MARK: - Typing: the wire
+
+@Test func aTypeAimedAtFocusNeedsNoTitleAndThatIsTheWholePoint() async throws {
+    guard case .success(let request) = HarnessPolicy.decode(
+        line: #"{"id":"t1","verb":"type","text":"bluetooth","mode":"replace","target":"focused"}"#
+    ) else {
+        Issue.record("expected a decoded request")
+        return
+    }
+    #expect(request.verb == .type)
+    #expect(request.text == "bluetooth")
+    #expect(request.mode == .replace)
+    #expect(request.aimAtFocus)
+    #expect(request.thenConfirm == false)
+
+    // Absent mode is insert: the non-destructive one.
+    guard case .success(let defaulted) = HarnessPolicy.decode(
+        line: #"{"id":"t2","verb":"type","text":"x","title":"Untitled"}"#
+    ) else {
+        Issue.record("expected a decoded request")
+        return
+    }
+    #expect(defaulted.mode == .insert)
+    #expect(defaulted.aimAtFocus == false)
+}
+
+@Test func aTypeWithNothingToTypeOrAModeWeDoNotKnowIsRefused() async throws {
+    guard case .failure(let missingText) = HarnessPolicy.decode(
+        line: #"{"id":"t3","verb":"type","target":"focused"}"#
+    ) else {
+        Issue.record("expected a missing-field refusal")
+        return
+    }
+    #expect(missingText == .missingField("text"))
+
+    // "overwrite" is one synonym from "replace". Guessing here is how a caller
+    // gets a destructive write it did not ask for.
+    guard case .failure(let badMode) = HarnessPolicy.decode(
+        line: #"{"id":"t4","verb":"type","text":"x","target":"focused","mode":"overwrite"}"#
+    ) else {
+        Issue.record("expected an invalid-field refusal")
+        return
+    }
+    #expect(badMode == .invalidField(field: "mode", value: "overwrite"))
+    #expect(badMode.code == "invalidField")
+
+    guard case .failure(let badTarget) = HarnessPolicy.decode(
+        line: #"{"id":"t5","verb":"type","text":"x","target":"whatever"}"#
+    ) else {
+        Issue.record("expected an invalid-field refusal")
+        return
+    }
+    #expect(badTarget == .invalidField(field: "target", value: "whatever"))
+}
+
+// MARK: - Observability
+
+@Test func theFlightRecorderKeepsExactlyTheLastTwenty() async throws {
+    var buffer = RingBuffer<Int>(capacity: 20)
+    for value in 1...25 { buffer.append(value) }
+
+    #expect(buffer.elements.count == 20)
+    #expect(buffer.elements.first == 6)
+    #expect(buffer.elements.last == 25)
+    #expect(buffer.elements == Array(6...25))
+
+    // Under capacity it keeps everything, in order.
+    var small = RingBuffer<Int>(capacity: 20)
+    small.append(1)
+    small.append(2)
+    #expect(small.elements == [1, 2])
+}
+
+@Test func aSilentFailedWriteIsAnAnomalyAndAnOrdinaryRefusalIsNot() async throws {
+    // The kernel allowed it, the write said success, the second walk saw
+    // nothing. Every silent failure this project has measured looks like this.
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: "allow", verificationStatus: "notObserved",
+        errorCode: nil, walkMilliseconds: nil, recentWalkMilliseconds: []
+    ) == .notObservedAfterAllow)
+
+    // Same non-observation after a refusal is not surprising at all — nothing
+    // was performed.
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: "refuse", verificationStatus: "notObserved",
+        errorCode: nil, walkMilliseconds: nil, recentWalkMilliseconds: []
+    ) == nil)
+
+    // A confirmed write that landed is the healthy path and costs one append.
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: "allow", verificationStatus: "confirmed",
+        errorCode: nil, walkMilliseconds: 300, recentWalkMilliseconds: [300, 300, 300, 300, 300]
+    ) == nil)
+}
+
+@Test func anErrorOutsideTheOrdinaryRefusalsIsAnAnomaly() async throws {
+    for ordinary in HarnessObservability.ordinaryRefusalCodes {
+        #expect(HarnessObservability.anomaly(
+            kernelDecision: "n/a", verificationStatus: nil,
+            errorCode: ordinary, walkMilliseconds: nil, recentWalkMilliseconds: []
+        ) == nil, "\(ordinary) is the harness working, not the harness surprised")
+    }
+
+    for surprising in ["noFocusedElement", "performFailed", "noRootNode", "accessibilityPermissionNotGranted"] {
+        #expect(HarnessObservability.anomaly(
+            kernelDecision: "n/a", verificationStatus: nil,
+            errorCode: surprising, walkMilliseconds: nil, recentWalkMilliseconds: []
+        ) == .unexpectedError, "\(surprising) should trip a dump")
+    }
+}
+
+@Test func aSlowWalkTripsOnlyOnceThereIsSomethingToCompareItTo() async throws {
+    let steady = [100, 110, 90, 105, 95]
+
+    // 3x the median (100) is the line.
+    #expect(HarnessObservability.median(of: steady) == 100)
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: "allow", verificationStatus: "confirmed",
+        errorCode: nil, walkMilliseconds: 400, recentWalkMilliseconds: steady
+    ) == .walkFarSlowerThanRecentMedian)
+
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: "allow", verificationStatus: "confirmed",
+        errorCode: nil, walkMilliseconds: 250, recentWalkMilliseconds: steady
+    ) == nil)
+
+    // Cold start. Four samples is not a median, and a first real walk of the
+    // day firing an anomaly is exactly the noise that gets a diagnostic
+    // switched off.
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: "allow", verificationStatus: "confirmed",
+        errorCode: nil, walkMilliseconds: 20_000, recentWalkMilliseconds: [100, 110, 90, 105]
+    ) == nil)
+}
+
+@Test func onlyASecurityRefusalIsWorthAFlightRecorderDump() async throws {
+    // A kernel refusal is the policy working, and the audit line explains it.
+    // Off-screen, zero-area and wrong-role are things the caller COULD not do.
+    // A secure field or an implausible label is something it SHOULD not — that
+    // is the shape of an attempt, and the one worth twenty requests of context.
+    let ordinary = HarnessObservability.anomaly(
+        kernelDecision: "refuse",
+        kernelReason: ActionSafetyKernel.outsideBoundsRefusalReason,
+        verificationStatus: nil, errorCode: "kernelRefused",
+        walkMilliseconds: nil, recentWalkMilliseconds: []
+    )
+    #expect(ordinary == nil)
+
+    let secure = HarnessObservability.anomaly(
+        kernelDecision: "refuse",
+        kernelReason: ActionSafetyKernel.secureFieldRefusalReason(subrole: "AXSecureTextField"),
+        verificationStatus: nil, errorCode: "kernelRefused",
+        walkMilliseconds: nil, recentWalkMilliseconds: []
+    )
+    #expect(secure == .securityRefusal)
+
+    let injectionShaped = HarnessObservability.anomaly(
+        kernelDecision: "refuse",
+        kernelReason: ActionSafetyKernel.implausibleNameRefusalReason,
+        verificationStatus: nil, errorCode: "kernelRefused",
+        walkMilliseconds: nil, recentWalkMilliseconds: []
+    )
+    #expect(injectionShaped == .securityRefusal)
 }

@@ -37,6 +37,13 @@ struct HarnessRawRequest: Decodable {
     let nearPoint: HarnessPoint?
     let dryRun: Bool?
     let confirmed: Bool?
+
+    // type only
+    let text: String?
+    let mode: String?
+    /// `"focused"`, or absent for the ordinary name-resolved path.
+    let target: String?
+    let thenConfirm: Bool?
 }
 
 struct HarnessPoint: Decodable {
@@ -50,6 +57,7 @@ enum HarnessVerb: String, CaseIterable {
     case snapshot
     case press
     case select
+    case type
 
     /// Whether this verb can change the world. The kill switch stops these and
     /// leaves the read-only pair working, so an operator who tripped it can
@@ -57,7 +65,7 @@ enum HarnessVerb: String, CaseIterable {
     var isMutating: Bool {
         switch self {
         case .ping, .snapshot: return false
-        case .press, .select: return true
+        case .press, .select, .type: return true
         }
     }
 
@@ -65,6 +73,7 @@ enum HarnessVerb: String, CaseIterable {
         switch self {
         case .press: return .press
         case .select: return .select
+        case .type: return .type
         case .ping, .snapshot: return nil
         }
     }
@@ -77,11 +86,17 @@ enum HarnessRequestError: Error, Equatable {
     case unknownVerb(String)
     case missingField(String)
 
+    /// A field that is present, well-typed and not a value we recognise —
+    /// `"mode":"overwrite"`, `"target":"whatever"`. Same reason `unknownVerb`
+    /// exists: the near-miss is exactly the case where guessing is worst.
+    case invalidField(field: String, value: String)
+
     var code: String {
         switch self {
         case .malformedJSON: return "malformedJSON"
         case .unknownVerb: return "unknownVerb"
         case .missingField: return "missingField"
+        case .invalidField: return "invalidField"
         }
     }
 
@@ -95,6 +110,8 @@ enum HarnessRequestError: Error, Equatable {
             return "unknown verb \"\(verb)\" — known verbs: \(HarnessVerb.allCases.map(\.rawValue).joined(separator: ", "))"
         case .missingField(let field):
             return "missing required field \"\(field)\""
+        case .invalidField(let field, let value):
+            return "field \"\(field)\" does not accept \"\(value)\""
         }
     }
 }
@@ -111,6 +128,13 @@ struct HarnessRequest: Equatable {
     let nearPoint: CGPoint?
     let requestedDryRun: Bool?
     let confirmed: Bool
+
+    // type only. Defaulted so every existing construction still reads the same.
+    var text: String = ""
+    var mode: TypeMode = .insert
+    /// Aim at whatever holds keyboard focus instead of resolving a name.
+    var aimAtFocus: Bool = false
+    var thenConfirm: Bool = false
 }
 
 // MARK: - Pure decision logic
@@ -139,8 +163,34 @@ enum HarnessPolicy {
             return .failure(.unknownVerb(raw.verb))
         }
 
-        if verb.elementAction != nil, (raw.title ?? "").isEmpty {
+        // "focused" is the only value `target` takes. Anything else is a typo
+        // that would otherwise be silently treated as "resolve by name" and aim
+        // somewhere the caller did not ask for.
+        var aimAtFocus = false
+        if let target = raw.target {
+            guard target == "focused" else {
+                return .failure(.invalidField(field: "target", value: target))
+            }
+            aimAtFocus = true
+        }
+
+        // A name is what an acting verb aims with — unless it is aiming by focus,
+        // which is the whole point of the focus target.
+        if verb.elementAction != nil, !aimAtFocus, (raw.title ?? "").isEmpty {
             return .failure(.missingField("title"))
+        }
+
+        var mode = TypeMode.insert
+        if verb == .type {
+            guard !(raw.text ?? "").isEmpty else {
+                return .failure(.missingField("text"))
+            }
+            if let requestedMode = raw.mode {
+                guard let parsed = TypeMode(rawValue: requestedMode) else {
+                    return .failure(.invalidField(field: "mode", value: requestedMode))
+                }
+                mode = parsed
+            }
         }
 
         return .success(HarnessRequest(
@@ -151,7 +201,11 @@ enum HarnessPolicy {
             withinNamed: raw.withinNamed,
             nearPoint: raw.nearPoint?.cgPoint,
             requestedDryRun: raw.dryRun,
-            confirmed: raw.confirmed ?? false
+            confirmed: raw.confirmed ?? false,
+            text: raw.text ?? "",
+            mode: mode,
+            aimAtFocus: aimAtFocus,
+            thenConfirm: raw.thenConfirm ?? false
         ))
     }
 
@@ -214,11 +268,17 @@ enum HarnessPolicy {
     ///
     /// `title` is app-facing text a caller supplied; JSON encoding escapes it,
     /// which is the same reason `UntrustedText.forDisplay` exists.
+    /// `app` and `session` are the two fields that make an old log readable.
+    /// Without `app` a line does not say which program it acted on; without
+    /// `session` two runs of the harness interleave in one file and a stale
+    /// binary's lines look like this one's.
     static func auditLine(
         at timestamp: Date,
         id: String,
         verb: String,
         target: String?,
+        app: String?,
+        session: String,
         dryRun: Bool,
         confirmed: Bool,
         kernel: String,
@@ -230,6 +290,8 @@ enum HarnessPolicy {
             "id": id,
             "verb": verb,
             "target": target ?? NSNull(),
+            "app": app ?? NSNull(),
+            "session": session,
             "dryRun": dryRun,
             "confirmed": confirmed,
             "kernel": kernel,
@@ -241,6 +303,115 @@ enum HarnessPolicy {
             return "{\"timestamp\":\"\(auditTimestampFormatter.string(from: timestamp))\",\"outcome\":\"auditEncodingFailed\"}"
         }
         return text
+    }
+}
+
+// MARK: - Observability
+//
+// The constraint here is that a healthy run costs one array append. Nothing
+// polls, nothing times, nothing is written until something is actually wrong —
+// because a diagnostic that runs all the time is a diagnostic nobody leaves on.
+
+/// Last-N, and nothing else. Used for the request/response summaries and for
+/// the walk durations the slow-walk rule needs a median of.
+struct RingBuffer<Element> {
+    let capacity: Int
+    private(set) var elements: [Element] = []
+
+    init(capacity: Int) {
+        self.capacity = capacity
+    }
+
+    mutating func append(_ element: Element) {
+        elements.append(element)
+        if elements.count > capacity {
+            elements.removeFirst(elements.count - capacity)
+        }
+    }
+}
+
+/// Exactly three things are worth waking up for. Each is computed from data the
+/// response already carries — no extra reads, no extra clock.
+enum HarnessAnomaly: String, Equatable, CaseIterable {
+    /// The kernel said the world would change, the write said `.success`, and
+    /// the second walk saw nothing. This is the signature of every silent
+    /// failure this project has measured.
+    case notObservedAfterAllow = "verification notObserved after the kernel allowed"
+
+    /// Any error that is not one of the ordinary refusals. Those are the
+    /// harness working; anything else is the harness surprised.
+    case unexpectedError = "response error is not an ordinary refusal"
+
+    /// The kernel refused on a security ground — a secure field, or a label
+    /// that is not a label. Something tried to do a thing it should not, which
+    /// is the one refusal worth twenty requests of context.
+    case securityRefusal = "the kernel refused on a security ground"
+
+    /// The walk took more than 3x the recent median. "It went sloppy" is
+    /// usually this, and it is invisible in a single line.
+    case walkFarSlowerThanRecentMedian = "walk took more than 3x the median of recent walks"
+}
+
+enum HarnessObservability {
+
+    /// The refusals that mean the harness is doing its job. An error outside
+    /// this set is the interesting kind.
+    ///
+    /// `invalidField` is here for the same reason `missingField` is: a caller
+    /// typing `"mode":"overwrite"` is a bad request, not a sick machine.
+    ///
+    /// `kernelRefused` is deliberately NOT here. A hard refusal — a secure
+    /// field, a non-text role — is rare and is exactly the moment you want the
+    /// last twenty requests on disk, because something asked this machine to do
+    /// a thing it will not do.
+    static let ordinaryRefusalCodes: Set<String> = [
+        "killSwitch", "confirmationRequired", "notFound", "ambiguous",
+        "dryRun", "unknownVerb", "malformedJSON", "missingField", "invalidField",
+        // A kernel refusal is the policy working, and the audit line already
+        // says which rule fired. Only a refusal on SECURITY grounds is worth a
+        // dump — see `kernelReason` below.
+        "kernelRefused"
+    ]
+
+    /// Below this many samples the median is noise, and a cold start would fire
+    /// the slow-walk rule on the first real walk of the day.
+    static let minimumWalkSamples = 5
+    static let slowWalkMultiplier = 3
+
+    static func median(of values: [Int]) -> Int? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        return sorted[sorted.count / 2]
+    }
+
+    /// nil when nothing is wrong. Checked in order of how much each one tells
+    /// you: a silent failed write first, an unexpected error next, a slow walk
+    /// last.
+    static func anomaly(
+        kernelDecision: String?,
+        kernelReason: String? = nil,
+        verificationStatus: String?,
+        errorCode: String?,
+        walkMilliseconds: Int?,
+        recentWalkMilliseconds: [Int]
+    ) -> HarnessAnomaly? {
+        if verificationStatus == "notObserved", kernelDecision == "allow" {
+            return .notObservedAfterAllow
+        }
+        if let kernelReason, ActionSafetyKernel.isSecurityRefusal(reason: kernelReason) {
+            return .securityRefusal
+        }
+        if let errorCode, !ordinaryRefusalCodes.contains(errorCode) {
+            return .unexpectedError
+        }
+        if let walkMilliseconds,
+           recentWalkMilliseconds.count >= minimumWalkSamples,
+           let median = median(of: recentWalkMilliseconds),
+           median > 0,
+           walkMilliseconds > median * slowWalkMultiplier {
+            return .walkFarSlowerThanRecentMedian
+        }
+        return nil
     }
 }
 
@@ -258,9 +429,37 @@ final class HarnessServer {
     static var socketURL: URL { supportDirectory.appendingPathComponent("harness.sock") }
     static var killSwitchURL: URL { supportDirectory.appendingPathComponent("HARNESS_DISABLED") }
     static var auditLogURL: URL { supportDirectory.appendingPathComponent("harness-audit.log") }
+    static var rotatedAuditLogURL: URL { supportDirectory.appendingPathComponent("harness-audit.log.1") }
+
+    /// This log lives on the owner's machine and nothing prunes it. 5 MB is
+    /// roughly 20,000 audit lines — far more history than any question about
+    /// "what happened just now" needs, and one rotation keeps twice that.
+    static let auditLogRotationBytes = 5 * 1024 * 1024
+    static let maximumAnomalyDumps = 5
+
+    /// One per app launch. Two runs of the harness append to the same file, and
+    /// without this their lines are indistinguishable — including a stale
+    /// binary's, which this project has already been fooled by once.
+    static let sessionIdentifier = String(UUID().uuidString.prefix(8))
 
     private let globalDryRun: Bool
     private var listeningDescriptor: Int32 = -1
+
+    /// The last 20 request/response summaries, **without** the `elements` array
+    /// — that array is the large part of a snapshot and the part that says the
+    /// least about a failure. Written out only when an anomaly trips, so the
+    /// healthy path costs one array append.
+    private var flightRecorder = RingBuffer<[String: Any]>(capacity: 20)
+
+    /// Walk durations, **kept per app**.
+    ///
+    /// Measured 2026-09-10 with the first version of this, which kept one
+    /// buffer: ten walks of TextEdit (5-12 ms) followed by one of System
+    /// Settings (152 ms) fired the slow-walk rule and wrote a dump. Nothing was
+    /// wrong — System Settings is 20x TextEdit's window and always has been.
+    /// A cross-app median measures which app you switched to, and an anomaly
+    /// rule that fires on an app switch is one that gets switched off.
+    private var recentWalkMillisecondsByApp: [String: RingBuffer<Int>] = [:]
 
     init(globalDryRun: Bool) {
         self.globalDryRun = globalDryRun
@@ -442,18 +641,129 @@ final class HarnessServer {
             // so it is logged exactly like one that ran.
             appendAudit(HarnessPolicy.auditLine(
                 at: startedAt, id: "", verb: "?", target: nil,
+                app: Self.frontmostBundleIdentifier(), session: Self.sessionIdentifier,
                 dryRun: globalDryRun, confirmed: false,
                 kernel: "n/a", outcome: error.code,
                 milliseconds: elapsedMilliseconds(since: startedAt)
             ))
-            return ["ok": false, "id": "", "error": error.code, "message": error.message]
+            return observe(
+                ["ok": false, "id": "", "error": error.code, "message": error.message],
+                verb: "?", startedAt: startedAt
+            )
 
         case .success(let request):
             var response = execute(request, startedAt: startedAt)
             response["id"] = request.id
             response["provenance"] = Self.provenanceNote
-            return response
+            return observe(response, verb: request.verb.rawValue, startedAt: startedAt)
         }
+    }
+
+    /// The whole observability slice, in one place on the way out.
+    ///
+    /// Every input is already in the response — no second walk, no extra clock,
+    /// no state kept beyond two ring buffers.
+    private func observe(
+        _ response: [String: Any],
+        verb: String,
+        startedAt: Date
+    ) -> [String: Any] {
+        var summary = response
+        // The elements array is most of a snapshot's bytes and none of its
+        // diagnostic value. Everything else stays.
+        summary["elements"] = nil
+        summary["_verb"] = verb
+        summary["_at"] = HarnessPolicy.auditTimestampFormatter.string(from: startedAt)
+
+        let walkMilliseconds = response["walkMilliseconds"] as? Int
+        let walkedApp = (response["bundleIdentifier"] as? String) ?? "unknown"
+        var recentWalks = recentWalkMillisecondsByApp[walkedApp] ?? RingBuffer<Int>(capacity: 20)
+
+        let anomaly = HarnessObservability.anomaly(
+            kernelDecision: (response["kernel"] as? [String: Any])?["decision"] as? String,
+            kernelReason: (response["kernel"] as? [String: Any])?["reason"] as? String,
+            verificationStatus: (response["verification"] as? [String: Any])?["status"] as? String,
+            errorCode: response["error"] as? String,
+            walkMilliseconds: walkMilliseconds,
+            recentWalkMilliseconds: recentWalks.elements
+        )
+
+        flightRecorder.append(summary)
+        // Appended *after* the check, so a walk is never compared against itself.
+        if let walkMilliseconds {
+            recentWalks.append(walkMilliseconds)
+            recentWalkMillisecondsByApp[walkedApp] = recentWalks
+        }
+
+        guard let anomaly else { return response }
+
+        var annotated = response
+        if let dumpPath = writeAnomalyDump(anomaly, walkedApp: walkedApp, recentWalks: recentWalks.elements) {
+            annotated["anomaly"] = ["rule": anomaly.rawValue, "dump": dumpPath]
+            // One audit line naming the rule, so the log alone tells you a dump
+            // exists and what to look for in it.
+            appendAudit(HarnessPolicy.auditLine(
+                at: Date(), id: (response["id"] as? String) ?? "", verb: verb,
+                target: anomaly.rawValue,
+                app: Self.frontmostBundleIdentifier(), session: Self.sessionIdentifier,
+                dryRun: globalDryRun, confirmed: false,
+                kernel: "n/a", outcome: "anomaly",
+                milliseconds: elapsedMilliseconds(since: startedAt)
+            ))
+        }
+        return annotated
+    }
+
+    /// Writes the ring buffer out, keeping at most five files. Returns the path
+    /// so the response and the audit line can name it.
+    private func writeAnomalyDump(
+        _ anomaly: HarnessAnomaly,
+        walkedApp: String,
+        recentWalks: [Int]
+    ) -> String? {
+        let timestamp = HarnessPolicy.auditTimestampFormatter.string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let url = Self.supportDirectory
+            .appendingPathComponent("harness-anomaly-\(timestamp).json")
+
+        let payload: [String: Any] = [
+            "rule": anomaly.rawValue,
+            "session": Self.sessionIdentifier,
+            "app": Self.frontmostBundleIdentifier() ?? NSNull(),
+            // The samples the slow-walk rule was comparing against, and which
+            // app they belong to — a median is meaningless without both.
+            "walkedApp": walkedApp,
+            "recentWalkMilliseconds": recentWalks,
+            "requests": flightRecorder.elements
+        ]
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]
+        ) else { return nil }
+
+        try? FileManager.default.createDirectory(at: Self.supportDirectory, withIntermediateDirectories: true)
+        guard (try? data.write(to: url)) != nil else { return nil }
+        pruneAnomalyDumps()
+        return url.path
+    }
+
+    private func pruneAnomalyDumps() {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: Self.supportDirectory, includingPropertiesForKeys: nil
+        )) ?? []
+        // Named by ISO timestamp, so lexicographic order is chronological.
+        let dumps = contents
+            .filter { $0.lastPathComponent.hasPrefix("harness-anomaly-") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard dumps.count > Self.maximumAnomalyDumps else { return }
+        for stale in dumps.prefix(dumps.count - Self.maximumAnomalyDumps) {
+            try? FileManager.default.removeItem(at: stale)
+        }
+    }
+
+    /// Which app a line refers to. Clicky is `LSUIElement`, so it never takes
+    /// focus itself — the frontmost app is the one being acted on.
+    static func frontmostBundleIdentifier() -> String? {
+        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
     }
 
     private func execute(_ request: HarnessRequest, startedAt: Date) -> [String: Any] {
@@ -485,7 +795,7 @@ final class HarnessServer {
         case .snapshot:
             return snapshotResponse(request, dryRun: dryRun, startedAt: startedAt)
 
-        case .press, .select:
+        case .press, .select, .type:
             return actResponse(request, dryRun: dryRun, startedAt: startedAt)
         }
     }
@@ -568,6 +878,10 @@ final class HarnessServer {
             return response
         }
         response["application"] = snapshot.applicationName
+        response["bundleIdentifier"] = snapshot.bundleIdentifier
+        // Carried on every acting response, not just snapshot, because the
+        // slow-walk anomaly rule has nothing else to compare.
+        response["walkMilliseconds"] = Int(snapshot.walkDurationInSeconds * 1000)
 
         let intent = ElementActionIntent(
             role: request.role,
@@ -578,28 +892,66 @@ final class HarnessServer {
         )
 
         let resolvedNode: AccessibilityElementNode
-        switch ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode) {
-        case .resolved(let node):
-            resolvedNode = node
-            response["resolution"] = ["status": "resolved", "matchCount": 1]
-        case .notFound:
-            response["resolution"] = ["status": "notFound", "matchCount": 0]
-            response["ok"] = false
-            audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
-            return response
-        case .ambiguous(let matchCount):
-            response["resolution"] = ["status": "ambiguous", "matchCount": matchCount]
-            response["ok"] = false
-            audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ambiguous", startedAt: startedAt)
-            return response
+        if request.aimAtFocus {
+            // The OS says what has focus. No name is involved, which is the
+            // point: the fields most worth typing into are anonymous.
+            guard let focusedNode = AccessibilityTypePerformer.focusedNode() else {
+                response["resolution"] = ["status": "noFocusedElement", "matchCount": 0]
+                response["ok"] = false
+                response["error"] = "noFocusedElement"
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: "noFocusedElement", startedAt: startedAt)
+                return response
+            }
+            resolvedNode = focusedNode
+            response["resolution"] = ["status": "focused", "matchCount": 1]
+        } else {
+            switch ElementActionIntentResolver.resolve(intent, inTreeRootedAt: rootNode) {
+            case .resolved(let node):
+                resolvedNode = node
+                response["resolution"] = ["status": "resolved", "matchCount": 1]
+            case .notFound:
+                response["resolution"] = ["status": "notFound", "matchCount": 0]
+                response["ok"] = false
+                response["error"] = "notFound"
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
+                return response
+            case .ambiguous(let matchCount):
+                response["resolution"] = ["status": "ambiguous", "matchCount": matchCount]
+                response["ok"] = false
+                response["error"] = "ambiguous"
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ambiguous", startedAt: startedAt)
+                return response
+            }
         }
         response["resolved"] = Self.summarise(resolvedNode)
+
+        // What the element itself says about being typed into. Four reads on
+        // one element — never a per-node cost — and skipped entirely for a
+        // secure field, which is refused on its subrole alone.
+        var typingContext: ActionSafetyKernel.TypingContext?
+        if request.verb == .type, resolvedNode.subrole != ActionSafetyKernel.secureFieldSubrole {
+            let element = resolvedNode.accessibilityElement
+            let settable = element.map(AccessibilityTypePerformer.settableAttributes) ?? []
+            let currentValue = element.flatMap(AccessibilityTypePerformer.stringValue) ?? ""
+            typingContext = ActionSafetyKernel.TypingContext(
+                mode: request.mode,
+                settableAttributes: settable,
+                currentValueLength: currentValue.count,
+                aimedByFocus: request.aimAtFocus
+            )
+            response["field"] = [
+                "settableAttributes": settable.sorted(),
+                "valueLength": currentValue.count,
+                "mode": request.mode.rawValue
+            ]
+        }
 
         let decision = ActionSafetyKernel.evaluate(
             intent: intent,
             resolvedNode: resolvedNode,
             matchCount: 1,
-            visibleBounds: rootNode.frameInAppKitCoordinates
+            visibleBounds: rootNode.frameInAppKitCoordinates,
+            typing: typingContext
         )
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
@@ -685,6 +1037,54 @@ final class HarnessServer {
                 response["performed"] = ["status": "noLiveElement"]
                 performedOK = false
             }
+
+        case .type:
+            guard let element = resolvedNode.accessibilityElement else {
+                response["ok"] = false
+                response["error"] = "noLiveElement"
+                audit(request, dryRun: dryRun, kernel: described.decision, outcome: "noLiveElement", startedAt: startedAt)
+                return response
+            }
+
+            let outcome = AccessibilityTypePerformer.type(request.text, mode: request.mode, into: element)
+
+            // For typing, the read-back IS the evidence — the text is the
+            // effect. The fingerprint below says whether the app *reacted*,
+            // which is a different question, and they are reported separately
+            // on purpose.
+            let containsWhatWeWrote = outcome.valueAfter?.contains(request.text) ?? false
+            response["performed"] = [
+                "status": outcome.error == .success ? "sent" : "failed",
+                "attributeWritten": outcome.attributeWritten,
+                "axErrorRawValue": outcome.error.rawValue,
+                "milliseconds": outcome.milliseconds,
+                "valueLengthBefore": outcome.valueLengthBefore,
+                "valueLengthAfter": outcome.valueAfter?.count ?? NSNull(),
+                // App-written text going into a log and a response: escaped and
+                // capped, like every other name this harness prints.
+                "valueAfter": outcome.valueAfter.map { UntrustedText($0).forDisplay } ?? NSNull(),
+                "readBackContainsText": containsWhatWeWrote
+            ]
+            // `.success` on a write that changed nothing has been measured three
+            // times in this repo. The field's own text is what decides here.
+            performedOK = outcome.error == .success && containsWhatWeWrote
+
+            if request.thenConfirm {
+                // A missing AXConfirm is never a failure of the type — measured
+                // 2026-09-10, System Settings' search filtered live with no
+                // confirm at all.
+                let publishesConfirm = resolvedNode.publishedActionNames.contains(kAXConfirmAction)
+                if publishesConfirm {
+                    let confirmResult = AccessibilityActionPerformer.perform(kAXConfirmAction, on: element)
+                    response["confirm"] = [
+                        "published": true,
+                        "axErrorRawValue": confirmResult.error.rawValue,
+                        "milliseconds": confirmResult.milliseconds
+                    ]
+                } else {
+                    response["confirm"] = ["published": false]
+                }
+            }
         }
 
         guard performedOK else {
@@ -721,8 +1121,19 @@ final class HarnessServer {
             response["verification"] = [
                 "status": "notObserved", "milliseconds": milliseconds, "appeared": [String]()
             ]
-            response["ok"] = false
-            response["error"] = "notVerified"
+            // For a press or a select the fingerprint is the only evidence there
+            // is. For a type it is the *second* piece: the text is the effect,
+            // and the field already read it back. An app that accepted the text
+            // and did not otherwise move is a real, ordinary outcome — so the
+            // two are reported separately rather than collapsed into one verdict.
+            if request.verb == .type {
+                response["ok"] = true
+                response["verificationNote"] =
+                    "the field read back the text; the window's named elements did not change"
+            } else {
+                response["ok"] = false
+                response["error"] = "notVerified"
+            }
             audit(request, dryRun: dryRun, kernel: described.decision, outcome: "notObserved", startedAt: startedAt)
         case .couldNotReadWindow:
             response["verification"] = ["status": "couldNotReadWindow"]
@@ -747,7 +1158,9 @@ final class HarnessServer {
             at: startedAt,
             id: request.id,
             verb: request.verb.rawValue,
-            target: request.title.isEmpty ? nil : request.title,
+            target: request.title.isEmpty ? (request.aimAtFocus ? "<focused>" : nil) : request.title,
+            app: Self.frontmostBundleIdentifier(),
+            session: Self.sessionIdentifier,
             dryRun: dryRun,
             confirmed: request.confirmed,
             kernel: kernel,
@@ -756,11 +1169,13 @@ final class HarnessServer {
         ))
     }
 
-    /// Append-only, and it never truncates. The log is the only record that a
-    /// refusal happened at all — a refused request leaves nothing else behind.
+    /// Append-only, and it rotates rather than truncates. The log is the only
+    /// record that a refusal happened at all — a refused request leaves nothing
+    /// else behind — so history is kept, just bounded.
     private func appendAudit(_ line: String) {
         let url = Self.auditLogURL
         let data = Data((line + "\n").utf8)
+        rotateAuditLogIfLarge()
         if let handle = try? FileHandle(forWritingTo: url) {
             defer { try? handle.close() }
             _ = try? handle.seekToEnd()
@@ -769,6 +1184,16 @@ final class HarnessServer {
             try? FileManager.default.createDirectory(at: Self.supportDirectory, withIntermediateDirectories: true)
             try? data.write(to: url)
         }
+    }
+
+    /// One old file, then the previous one goes. Two files is enough to answer
+    /// "what happened just before this" and small enough that nobody has to
+    /// think about it.
+    private func rotateAuditLogIfLarge() {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: Self.auditLogURL.path)
+        guard let size = attributes?[.size] as? Int, size > Self.auditLogRotationBytes else { return }
+        try? FileManager.default.removeItem(at: Self.rotatedAuditLogURL)
+        try? FileManager.default.moveItem(at: Self.auditLogURL, to: Self.rotatedAuditLogURL)
     }
 
     private func elapsedMilliseconds(since date: Date) -> Int {

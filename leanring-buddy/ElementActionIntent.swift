@@ -7,6 +7,7 @@
 //  code always decides whether and how they execute.
 //
 
+import AppKit
 import ApplicationServices
 import Foundation
 
@@ -22,14 +23,45 @@ enum ElementAction {
     /// not in the action API at all.
     case select
 
+    /// Typing is a property write too, and which property depends on the mode.
+    /// See `TypeMode`.
+    case type
+
     /// The published action this needs, or nil when the verb is a property
     /// write and there is no action to look for.
     var accessibilityActionName: String? {
         switch self {
         case .press:
             return kAXPressAction
-        case .select:
+        case .select, .type:
             return nil
+        }
+    }
+}
+
+/// Replace the field, or insert at the caret. Two different attributes, and the
+/// difference is measurable, not stylistic.
+///
+/// Probed 2026-09-10 on TextEdit's `AXTextArea` and System Settings' search
+/// field (role `AXTextField`, subrole `AXSearchField`): both publish `AXValue`,
+/// `AXSelectedText`, `AXSelectedTextRange` and `AXFocused` as **settable**.
+///
+///     writing AXValue         replaces the WHOLE field — TextEdit went to
+///                             "Edited", and System Settings' search filtered
+///                             live with no AXConfirm needed at all
+///     writing AXSelectedText  inserts at the caret, once AXSelectedTextRange
+///                             has put the caret where you mean
+enum TypeMode: String, Equatable, CaseIterable {
+    case insert
+    case replace
+
+    /// The attribute the mode actually writes — and therefore the one the
+    /// element must say is settable before we are allowed to try. A role is a
+    /// convention; this is the element answering for itself.
+    var settableAttributeRequired: String {
+        switch self {
+        case .insert: return kAXSelectedTextAttribute
+        case .replace: return kAXValueAttribute
         }
     }
 }
@@ -337,6 +369,175 @@ enum AccessibilitySelectionPerformer {
     /// element being asked, not us guessing from `AXRow`.
     static func isSelectable(_ element: AXUIElement) -> Bool {
         isSettable(element, selectedAttribute)
+    }
+}
+
+/// Typing: the other half of the action API that is not an action.
+///
+/// Same shape as `AccessibilitySelectionPerformer` and for the same reasons —
+/// ask the element what is settable rather than believing its role, raise the
+/// messaging timeout on that one element because a write animates, return the
+/// raw `AXError` next to the clock, and read the value back.
+///
+/// The read-back matters more here than anywhere else in this project: for a
+/// press or a select the effect is somewhere else in the tree, but for typing
+/// **the text is the effect**. If the field does not contain what we wrote, the
+/// write did not happen, whatever `AXError` says.
+enum AccessibilityTypePerformer {
+
+    static let typingTimeoutInSeconds: Float = 5.0
+
+    /// The four attributes probed before a write. `AXFocused` and
+    /// `AXSelectedTextRange` are not required by either mode, but they are what
+    /// separates "this is a live text field" from "this is a label with a role
+    /// that looks like one", and they cost one round trip each on a single
+    /// element — not per node.
+    static let probedAttributes = [
+        kAXValueAttribute, kAXSelectedTextAttribute,
+        kAXSelectedTextRangeAttribute, kAXFocusedAttribute
+    ]
+
+    struct Outcome: Equatable {
+        let attributeWritten: String
+        let error: AXError
+        let milliseconds: Int
+        let valueLengthBefore: Int
+        /// nil when the field would not answer at all after the write, which is
+        /// a different fact from "it answered with the old text".
+        let valueAfter: String?
+    }
+
+    /// The element's current text, or nil when it publishes none.
+    static func stringValue(of element: AXUIElement) -> String? {
+        var out: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &out) == .success else {
+            return nil
+        }
+        return out as? String
+    }
+
+    /// Which of the four the element says it will accept. Asked, never assumed —
+    /// Hammerspoon's author documents writes to non-settable attributes coming
+    /// back `.success` anyway, so this is the cheap half of the evidence and the
+    /// read-back is the other half.
+    static func settableAttributes(of element: AXUIElement) -> Set<String> {
+        Set(probedAttributes.filter { AccessibilitySelectionPerformer.isSettable(element, $0) })
+    }
+
+    /// Whoever has keyboard focus in the frontmost app, as a node.
+    ///
+    /// This exists because **text fields are frequently anonymous**: System
+    /// Settings' search field publishes no title, no description and an empty
+    /// value, so `displayName` is nil and no amount of name resolution reaches
+    /// it. A human does not aim at that field by name either — they click it,
+    /// and then type into whatever has focus. This is that.
+    ///
+    /// Built from direct reads rather than looked up in the walked tree on
+    /// purpose: focus can be in a sheet or a popover the window walk pruned, and
+    /// "not in the tree" would then be reported as "nothing has focus".
+    static func focusedNode() -> AccessibilityElementNode? {
+        guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+
+        var focusedValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement, kAXFocusedUIElementAttribute as CFString, &focusedValue
+        ) == .success,
+            let focusedValue,
+            CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else { return nil }
+        let element = focusedValue as! AXUIElement
+
+        func string(_ attribute: String) -> String? {
+            var out: AnyObject?
+            guard AXUIElementCopyAttributeValue(element, attribute as CFString, &out) == .success,
+                  let text = out as? String, !text.isEmpty else { return nil }
+            return text
+        }
+
+        let primaryDisplayHeight = NSScreen.screens.first?.frame.height ?? 0
+        let accessibilityFrame = frame(of: element) ?? .zero
+
+        return AccessibilityElementNode(
+            role: string(kAXRoleAttribute) ?? "AXUnknown",
+            subrole: string(kAXSubroleAttribute),
+            title: string(kAXTitleAttribute),
+            value: string(kAXValueAttribute),
+            elementDescription: string(kAXDescriptionAttribute),
+            frameInAppKitCoordinates: AccessibilityTreeWalker.convertAccessibilityFrameToAppKitFrame(
+                accessibilityFrame, primaryDisplayHeightInPoints: primaryDisplayHeight
+            ),
+            depth: 0,
+            children: [],
+            publishedActionNames: AccessibilityTreeWalker.copyActionNames(from: element),
+            accessibilityElement: element
+        )
+    }
+
+    /// AXFrame first, position + size as the fallback — the same order the
+    /// walker uses, because AXFrame is not an SDK constant and not every app
+    /// publishes it. A zero frame here would be read by the kernel as
+    /// "unreachable" and refuse a perfectly good field.
+    private static func frame(of element: AXUIElement) -> CGRect? {
+        var frameValue: AnyObject?
+        if AXUIElementCopyAttributeValue(element, "AXFrame" as CFString, &frameValue) == .success,
+           let frameValue, CFGetTypeID(frameValue) == AXValueGetTypeID() {
+            var rect = CGRect.zero
+            if AXValueGetValue(frameValue as! AXValue, .cgRect, &rect) { return rect }
+        }
+
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let positionValue, let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: position, size: size)
+    }
+
+    /// Writes `text` into `element`.
+    ///
+    /// `.insert` puts the caret at the end of the current value first — an
+    /// `AXSelectedText` write replaces the *selection*, and a field whose
+    /// selection is the whole value would be replaced by an insert, which is
+    /// exactly the destruction the replace confirmation exists to prevent.
+    /// The range is in UTF-16 units, which is what the AX text APIs count in.
+    static func type(_ text: String, mode: TypeMode, into element: AXUIElement) -> Outcome {
+        // A write animates: a text field re-lays out, a search field re-filters.
+        // It must not inherit the walker's 0.5 s read timeout.
+        AXUIElementSetMessagingTimeout(element, typingTimeoutInSeconds)
+
+        let valueBefore = stringValue(of: element) ?? ""
+        let startedAt = Date()
+        let error: AXError
+
+        switch mode {
+        case .replace:
+            error = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFString)
+        case .insert:
+            var caret = CFRange(location: valueBefore.utf16.count, length: 0)
+            if let caretValue = AXValueCreate(.cfRange, &caret) {
+                AXUIElementSetAttributeValue(
+                    element, kAXSelectedTextRangeAttribute as CFString, caretValue
+                )
+            }
+            error = AXUIElementSetAttributeValue(
+                element, kAXSelectedTextAttribute as CFString, text as CFString
+            )
+        }
+
+        return Outcome(
+            attributeWritten: mode.settableAttributeRequired,
+            error: error,
+            milliseconds: Int(Date().timeIntervalSince(startedAt) * 1000),
+            valueLengthBefore: valueBefore.count,
+            valueAfter: stringValue(of: element)
+        )
     }
 }
 
