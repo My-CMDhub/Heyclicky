@@ -27,14 +27,43 @@ enum ElementAction {
     /// See `TypeMode`.
     case type
 
+    /// Opening: a published action, and the one Finder actually answers to.
+    ///
+    /// Measured 2026-09-10: a Finder file row publishes only the hover pair
+    /// (`AXShowDefaultUI` / `AXShowAlternateUI`), but the `AXCell` inside it
+    /// publishes **`AXOpen`**. That is the whole reason this is a separate verb
+    /// rather than a press — Finder's window has 12 pressable elements and none
+    /// of them is a file.
+    case open
+
+    /// Pressing a menu item, resolved by its path down the menu bar rather than
+    /// by a name in the focused window. Same published action as a press; a
+    /// completely different way of finding the element, and a different set of
+    /// facts about its frame. See `AccessibilityMenu`.
+    case menu
+
     /// The published action this needs, or nil when the verb is a property
     /// write and there is no action to look for.
     var accessibilityActionName: String? {
         switch self {
-        case .press:
+        case .press, .menu:
             return kAXPressAction
+        case .open:
+            return "AXOpen"
         case .select, .type:
             return nil
+        }
+    }
+
+    /// Whether this verb's target is something drawn on screen, so that its
+    /// frame is evidence about whether we can act on it.
+    ///
+    /// True for everything in a window. False for a menu item, and measured
+    /// rather than assumed — see the note on the kernel's frame checks.
+    var targetHasAnOnScreenFrame: Bool {
+        switch self {
+        case .press, .select, .type, .open: return true
+        case .menu: return false
         }
     }
 }
@@ -596,5 +625,386 @@ enum SyntheticScroller {
             Thread.sleep(forTimeInterval: 0.02)
         }
         return true
+    }
+}
+
+/// The menu bar: the app's other tree, and the one this harness could not see.
+///
+/// **It hangs off the APPLICATION element, not the window.**
+/// `kAXMenuBarAttribute` on `AXUIElementCreateApplication(pid)`. Every walk in
+/// this project starts at `kAXFocusedWindow`, so none of the below has ever
+/// appeared in a snapshot. Measured 2026-09-10, menu items / named / pressable
+/// / with a shortcut / full read:
+///
+///     Finder            301  258  300  105    545 ms
+///     TextEdit          314  267  314   71  1,082 ms
+///     Mail              591  502  591  113  1,580 ms
+///     System Settings   205  181  205   27    577 ms
+///     Cursor            428  355  428  108    279 ms
+///     Google Chrome     325  281  324   72    539 ms
+///
+/// Finder's *window* publishes 12 pressable elements. Its *menu bar* publishes
+/// 300 — and a screenshot of a closed menu shows none of them, which is the
+/// whole argument for this being a verb of its own.
+///
+/// Re-measured through this code the same day, and the two numbers are not the
+/// same measurement: `menus` on Finder reports **257 items, 105 with a
+/// shortcut, 146 ms**. The shortcut count matches exactly; the item count is
+/// lower because separators and other unnamed entries are not listed, and the
+/// time is lower because each item's five attributes arrive in one batched
+/// read. Scoped to one menu (`["View"]`) it is 37 items in 20 ms — the prefix
+/// is a smaller *walk*, not a filter over a big one.
+///
+/// Shape, and it is regular:
+///
+///     AXMenuBar
+///       AXMenuBarItem "File"
+///         AXMenu                       ← a single wrapper, always
+///           AXMenuItem "New Finder Window"
+///           AXMenuItem "Open With"
+///             AXMenu                   ← submenus populate WITHOUT being opened
+///               AXMenuItem …
+///
+/// So a path is resolved by reading one level at a time — six or seven IPC
+/// reads, not the 545 ms full listing.
+enum AccessibilityMenu {
+
+    static let menuBarRole = "AXMenuBar"
+    static let menuRole = "AXMenu"
+    static let menuItemRole = "AXMenuItem"
+    static let menuBarItemRole = "AXMenuBarItem"
+
+    static let enabledAttribute = "AXEnabled"
+    static let cmdCharAttribute = "AXMenuItemCmdChar"
+    static let cmdModifiersAttribute = "AXMenuItemCmdModifiers"
+
+    /// Same rule as the window walk: every read below is synchronous
+    /// cross-process IPC and a busy app would otherwise block this process.
+    static let messagingTimeoutInSeconds: Float = 0.5
+
+    /// A listing is bounded exactly like a walk is, and it names which limit
+    /// fired — "this app has a big menu bar" and "this app stopped answering"
+    /// demand opposite responses.
+    static let maximumItemsListed = 3_000
+    static let listingTimeLimitInSeconds = 5.0
+
+    /// One menu element, flattened to what a resolution needs.
+    ///
+    /// `children` is populated only on hand-built trees; a live read fetches
+    /// them through the provider closure instead, which is what keeps a path
+    /// resolution to the path.
+    struct Node {
+        let label: String?
+        let role: String
+        let isEnabled: Bool
+        let shortcut: String?
+        let element: AXUIElement?
+        let children: [Node]
+
+        init(
+            label: String?,
+            role: String,
+            isEnabled: Bool = true,
+            shortcut: String? = nil,
+            element: AXUIElement? = nil,
+            children: [Node] = []
+        ) {
+            self.label = label
+            self.role = role
+            self.isEnabled = isEnabled
+            self.shortcut = shortcut
+            self.element = element
+            self.children = children
+        }
+    }
+
+    // MARK: - Resolution (pure; the provider is the only live part)
+
+    enum StepOutcome: Equatable {
+        case matched(index: Int)
+        /// What WAS there, which is the half that makes a miss actionable.
+        case notFound(available: [String])
+        case ambiguous(matchCount: Int)
+    }
+
+    enum Resolution: Equatable {
+        case resolved(label: String?, role: String, isEnabled: Bool)
+        case notFound(atStep: Int, step: String, available: [String])
+        case ambiguous(atStep: Int, step: String, matchCount: Int)
+        case emptyPath
+    }
+
+    /// One path step against one level.
+    ///
+    /// Never takes the first of several. Chrome publishes "Close Window" under
+    /// more than one menu and Finder repeats "Open" — a step matching twice is
+    /// a question, and a coin flip here is a wrong menu item pressed with no
+    /// undo.
+    static func match(step: String, among candidates: [Node]) -> StepOutcome {
+        let indices = candidates.indices.filter { candidates[$0].label == step }
+        switch indices.count {
+        case 1: return .matched(index: indices[0])
+        case 0: return .notFound(available: candidates.compactMap(\.label))
+        default: return .ambiguous(matchCount: indices.count)
+        }
+    }
+
+    /// The items one level down, stepping through the single `AXMenu` wrapper
+    /// that sits between a menu-bar item (or a submenu parent) and its entries.
+    static func entries(of node: Node, children: (Node) -> [Node]) -> [Node] {
+        let direct = children(node)
+        if direct.count == 1, direct[0].role == menuRole { return children(direct[0]) }
+        return direct
+    }
+
+    /// Walks **only the path**. `children` is the one impure part: live it is an
+    /// AX read, in a test it is `\.children` over a hand-built tree, and both
+    /// exercise the same stepping and the same `AXMenu` descent.
+    static func resolveNode(
+        path: [String],
+        from root: Node,
+        children: (Node) -> [Node]
+    ) -> (node: Node?, resolution: Resolution) {
+        guard !path.isEmpty else { return (nil, .emptyPath) }
+
+        var current = root
+        for (index, step) in path.enumerated() {
+            let candidates = entries(of: current, children: children)
+            switch match(step: step, among: candidates) {
+            case .matched(let matchedIndex):
+                current = candidates[matchedIndex]
+            case .notFound(let available):
+                return (nil, .notFound(atStep: index, step: step, available: available))
+            case .ambiguous(let matchCount):
+                return (nil, .ambiguous(atStep: index, step: step, matchCount: matchCount))
+            }
+        }
+        return (current, .resolved(label: current.label, role: current.role, isEnabled: current.isEnabled))
+    }
+
+    // MARK: - Listing
+
+    struct ListedItem {
+        let path: [String]
+        let role: String
+        let isEnabled: Bool
+        let shortcut: String?
+        let hasSubmenu: Bool
+    }
+
+    struct Listing {
+        let items: [ListedItem]
+        let milliseconds: Int
+        /// Empty means the listing finished. Never a bare `truncated: true` next
+        /// to a plausible count — it says which limit fired.
+        let stopReasons: [String]
+    }
+
+    /// Everything at or below `start`, with each item's full path from the bar.
+    ///
+    /// The prefix genuinely scopes the read: the caller resolves it first (one
+    /// level at a time) and passes the resolved node in, so `menus ["File"]` on
+    /// Mail reads File's subtree and not the other 550 items.
+    static func list(
+        from start: Node,
+        pathSoFar: [String],
+        children: (Node) -> [Node],
+        deadline: Date
+    ) -> Listing {
+        let startedAt = Date()
+        var items: [ListedItem] = []
+        var stopReasons: Set<String> = []
+        collect(start, pathSoFar: pathSoFar, children: children, deadline: deadline,
+                items: &items, stopReasons: &stopReasons)
+        return Listing(
+            items: items,
+            milliseconds: Int(Date().timeIntervalSince(startedAt) * 1000),
+            stopReasons: stopReasons.sorted()
+        )
+    }
+
+    private static func collect(
+        _ node: Node,
+        pathSoFar: [String],
+        children: (Node) -> [Node],
+        deadline: Date,
+        items: inout [ListedItem],
+        stopReasons: inout Set<String>
+    ) {
+        guard items.count < maximumItemsListed else {
+            stopReasons.insert(WalkStopReason.nodeLimit.rawValue)
+            return
+        }
+        guard Date() < deadline else {
+            stopReasons.insert(WalkStopReason.timeLimit.rawValue)
+            return
+        }
+
+        let childNodes = entries(of: node, children: children)
+
+        // The bar itself is not an item; everything below it is.
+        if node.role == menuItemRole || node.role == menuBarItemRole {
+            items.append(ListedItem(
+                path: pathSoFar,
+                role: node.role,
+                isEnabled: node.isEnabled,
+                shortcut: node.shortcut,
+                hasSubmenu: !childNodes.isEmpty
+            ))
+        }
+
+        for child in childNodes {
+            guard let label = child.label else { continue }
+            collect(child, pathSoFar: pathSoFar + [label], children: children,
+                    deadline: deadline, items: &items, stopReasons: &stopReasons)
+        }
+    }
+
+    // MARK: - Shortcuts
+
+    /// `AXMenuItemCmdModifiers` encodes Command **by its absence**.
+    ///
+    /// Bit 3 (value 8) set means "no Command"; bits 0, 1 and 2 are Shift, Option
+    /// and Control. So a bare ⌘N is mask 0 — the value that looks most like "no
+    /// modifiers" is the one that means Command, which is exactly the sort of
+    /// encoding you get wrong silently and never notice.
+    static func describeShortcut(character: String?, modifiers: Int?) -> String? {
+        guard let character, !character.isEmpty else { return nil }
+        let mask = modifiers ?? 0
+        var text = ""
+        // Apple's own display order: ⌃⌥⇧⌘, then the key.
+        if mask & 4 != 0 { text += "⌃" }
+        if mask & 2 != 0 { text += "⌥" }
+        if mask & 1 != 0 { text += "⇧" }
+        if mask & 8 == 0 { text += "⌘" }
+        return text + readableKey(character)
+    }
+
+    /// The cmd char is sometimes a control character — a raw `\u{8}` in a
+    /// response is not "readable", which is the whole job of this field.
+    static let readableKeys: [Character: String] = [
+        "\u{8}": "⌫", "\u{9}": "⇥", "\u{d}": "↩", "\u{1b}": "⎋", "\u{7f}": "⌦", " ": "␣"
+    ]
+
+    static func readableKey(_ character: String) -> String {
+        if let first = character.first, let symbol = readableKeys[first] { return symbol }
+        return character.uppercased()
+    }
+
+    // MARK: - The live reads
+
+    /// The menu bar of a running application, as a root node.
+    static func menuBarNode(for application: NSRunningApplication) -> Node? {
+        // Bound every read that follows. The menu bar is a different element,
+        // not a different rule.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), messagingTimeoutInSeconds)
+
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement, kAXMenuBarAttribute as CFString, &value
+        ) == .success,
+            let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+
+        return Node(label: nil, role: menuBarRole, element: (value as! AXUIElement))
+    }
+
+    /// One level of children, each read in a single batched call.
+    ///
+    /// Five attributes per child in one round trip, for the same reason the
+    /// walker batches: collapsing round trips is worth ~2.5x, and a full Mail
+    /// listing is 591 of these.
+    static let batchedAttributes = [
+        kAXRoleAttribute, kAXTitleAttribute, enabledAttribute,
+        cmdCharAttribute, cmdModifiersAttribute, kAXChildrenAttribute
+    ]
+
+    static func liveChildren(of node: Node) -> [Node] {
+        guard let element = node.element else { return [] }
+
+        var childrenValue: AnyObject?
+        let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenValue)
+        guard result == .success, let childElements = childrenValue as? [AXUIElement] else { return [] }
+
+        return childElements.map { childElement in
+            var rawValues: CFArray?
+            let batchResult = AXUIElementCopyMultipleAttributeValues(
+                childElement, batchedAttributes as CFArray, AXCopyMultipleAttributeOptions(), &rawValues
+            )
+            let values = (batchResult == .success ? rawValues as? [AnyObject] : nil) ?? []
+
+            func entry(_ index: Int) -> AnyObject? {
+                guard index < values.count else { return nil }
+                let value = values[index]
+                // A failed attribute comes back as an AXValue wrapping an
+                // AXError, not as a missing slot.
+                if CFGetTypeID(value) == AXValueGetTypeID(),
+                   AXValueGetType(value as! AXValue) == .axError { return nil }
+                return value
+            }
+
+            let title = entry(1) as? String
+            return Node(
+                label: (title?.isEmpty == false) ? title : nil,
+                role: (entry(0) as? String) ?? "AXUnknown",
+                // Absent AXEnabled means the app never said; treat that as
+                // enabled, because the refusal below must fire on a measured
+                // false and not on a missing read.
+                isEnabled: (entry(2) as? Bool) ?? true,
+                shortcut: describeShortcut(
+                    character: entry(3) as? String,
+                    modifiers: (entry(4) as? NSNumber)?.intValue
+                ),
+                element: childElement
+            )
+        }
+    }
+
+    /// The resolved menu item as the node type the safety kernel evaluates.
+    ///
+    /// Frame and action list are read **only here** — one element, after the
+    /// path resolved — rather than on every candidate at every level.
+    static func elementNode(for node: Node) -> AccessibilityElementNode {
+        let element = node.element
+        var frame = CGRect.zero
+        if let element {
+            var frameValue: AnyObject?
+            if AXUIElementCopyAttributeValue(element, "AXFrame" as CFString, &frameValue) == .success,
+               let frameValue, CFGetTypeID(frameValue) == AXValueGetTypeID() {
+                var rect = CGRect.zero
+                if AXValueGetValue(frameValue as! AXValue, .cgRect, &rect) { frame = rect }
+            }
+        }
+        let primaryDisplayHeight = NSScreen.screens.first?.frame.height ?? 0
+
+        return AccessibilityElementNode(
+            role: node.role,
+            subrole: nil,
+            title: node.label,
+            value: nil,
+            elementDescription: nil,
+            frameInAppKitCoordinates: AccessibilityTreeWalker.convertAccessibilityFrameToAppKitFrame(
+                frame, primaryDisplayHeightInPoints: primaryDisplayHeight
+            ),
+            depth: 0,
+            children: [],
+            publishedActionNames: element.map(AccessibilityTreeWalker.copyActionNames) ?? [],
+            accessibilityElement: element
+        )
+    }
+
+    /// How many windows the application has open, for verification.
+    ///
+    /// The window fingerprint is the harness's general "did the world move"
+    /// test, and it is blind to exactly the thing a File menu does: two Finder
+    /// windows on the same folder have the same named elements. This is one
+    /// extra IPC read that catches it.
+    static func windowCount(for application: NSRunningApplication) -> Int? {
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(
+            applicationElement, kAXWindowsAttribute as CFString, &value
+        ) == .success, let windows = value as? [AXUIElement] else { return nil }
+        return windows.count
     }
 }

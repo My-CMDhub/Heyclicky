@@ -37,6 +37,29 @@ enum ActionSafetyKernel {
     /// "type this here", so there is nothing for a human to confirm.
     static let typeableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
 
+    /// Roles that publish `AXOpen`. Measured 2026-09-10 on Finder: the file row
+    /// publishes only the hover pair, the `AXCell` inside it publishes `AXOpen`.
+    /// Deliberately empty: **opening always asks a human.**
+    ///
+    /// `AXOpen` does not navigate, it *launches whatever the thing is* — a
+    /// document, an installer, a script, an application. Double-clicking an
+    /// unknown file is how malware runs, and no verification undoes it. So there
+    /// is no role for which this kernel calls it ordinary, and every open lands
+    /// on `requireConfirmation`.
+    ///
+    /// The role census that settled it, measured 2026-09-10 on one Finder window
+    /// (1,467 nodes): **AXTextField 446 publish AXOpen and all 446 are named**
+    /// (the file list), AXCell 11 and **none named** (the sidebar — unreachable
+    /// by name anyway), AXStaticText 5 (the path bar). An earlier reading of
+    /// mine generalised from the sidebar's anonymous cells and had the roles
+    /// backwards; naming the majority role here would only have decided which
+    /// launches happen without asking.
+    static let navigationalOpenRoles: Set<String> = []
+
+    /// Roles a menu path resolves to. A menu bar item is the top level ("File"),
+    /// a menu item is everything below it.
+    static let navigationalMenuRoles: Set<String> = ["AXMenuItem", "AXMenuBarItem"]
+
     /// The one refusal in this kernel that has no confirmed path past it.
     static let secureFieldSubrole = "AXSecureTextField"
 
@@ -45,6 +68,8 @@ enum ActionSafetyKernel {
         case .press: return navigationalPressRoles
         case .select: return navigationalSelectRoles
         case .type: return typeableRoles
+        case .open: return navigationalOpenRoles
+        case .menu: return navigationalMenuRoles
         }
     }
 
@@ -108,8 +133,27 @@ enum ActionSafetyKernel {
     /// name an action is how app-controlled text becomes an instruction.
     static let implausibleNameRefusalReason = "listed but not usable as a target: the element's name is not a plain label"
 
+    /// Pressing a disabled menu item returns `.success` and does nothing —
+    /// measured 2026-09-10 on Finder's "New Folder", which reads
+    /// `AXEnabled == false` while focus is in the sidebar. Asking the item
+    /// first is what makes `AXError 0` mean anything at all on this path.
+    static func menuItemDisabledRefusalReason(name: String) -> String {
+        "menu item \(name) is disabled (AXEnabled false) — pressing it would return success and do nothing"
+    }
+
     static let destructiveTitleKeywords = [
-        "delete", "remove", "erase", "send", "buy", "pay", "purchase", "reset"
+        "delete", "remove", "erase", "send", "buy", "pay", "purchase", "reset",
+        // Menu-bar words. This check has always mattered; on a menu bar it
+        // matters most, because "Empty Trash" and "Quit" are two items away
+        // from anything and have no undo. "Move to Bin" / "Empty Bin" are
+        // spelled out rather than adding "bin", which is a substring of
+        // "Combine All Windows".
+        //
+        // Deliberately NOT here: "close". Closing a window is the ordinary
+        // inverse of opening one — it is what makes a menu test reversible —
+        // and adding it would put a question in front of every window close.
+        "trash", "quit", "empty", "eject", "log out", "shut down",
+        "move to bin", "empty bin"
     ]
 
     static func evaluate(
@@ -117,7 +161,8 @@ enum ActionSafetyKernel {
         resolvedNode: AccessibilityElementNode,
         matchCount: Int,
         visibleBounds: CGRect,
-        typing: TypingContext? = nil
+        typing: TypingContext? = nil,
+        menuItemEnabled: Bool? = nil
     ) -> SafetyDecision {
         // Order matters. Every refusal is checked before any permission.
 
@@ -134,18 +179,42 @@ enum ActionSafetyKernel {
             return .refuse(reason: "\(matchCount) elements match that title")
         }
 
+        // Both frame checks are about one thing: is this element drawn where a
+        // human could reach it. That question only has an answer for something
+        // in a window.
+        //
+        // Measured 2026-09-10 over the harness, Finder, both menus closed:
+        //
+        //     AXMenuBarItem  "File"               (113, 876, 43, 24)   drawn
+        //     AXMenuItem     "New Finder Window"  (  0,   0,  0,  0)   not drawn
+        //     AXMenuItem     "Close Window"       (  0,   0,  0,  0)   not drawn
+        //
+        // The bar item has a real rectangle because it is on screen. The item
+        // inside the closed menu is the project's third failure category, not a
+        // failed read: AXFrame *succeeds* and answers with a degenerate value,
+        // exactly like the sidebar rows that read (0, 0, 0, 0) in 2026-09-07.
+        // So the zero-area refusal would refuse every menu item in every app,
+        // and it would be right about the frame and wrong about the world.
+        //
+        // So the frame checks do not run on the menu path — stated as a
+        // property of the verb (`targetHasAnOnScreenFrame`), not silently
+        // skipped. Everything else the kernel does still applies, and the
+        // destructive-word escalation applies harder: a menu bar is where
+        // "Empty Trash" and "Quit" live.
         let frame = resolvedNode.frameInAppKitCoordinates
-        guard frame.width > 0, frame.height > 0 else {
-            return .refuse(reason: zeroAreaRefusalReason)
-        }
+        if intent.action.targetHasAnOnScreenFrame {
+            guard frame.width > 0, frame.height > 0 else {
+                return .refuse(reason: zeroAreaRefusalReason)
+            }
 
-        // Zero area is only the first disguise. Measured 2026-09-08:
-        // AXButton desc="Transfer or Reset" (354, -66, 459, 38) [AXPress] is
-        // named, correctly sized and pressable, and scrolled out of its pane.
-        // Reachability is the relationship between the frame and what is on
-        // screen, not a property of the frame alone.
-        guard frame.intersects(visibleBounds) else {
-            return .refuse(reason: outsideBoundsRefusalReason)
+            // Zero area is only the first disguise. Measured 2026-09-08:
+            // AXButton desc="Transfer or Reset" (354, -66, 459, 38) [AXPress] is
+            // named, correctly sized and pressable, and scrolled out of its pane.
+            // Reachability is the relationship between the frame and what is on
+            // screen, not a property of the frame alone.
+            guard frame.intersects(visibleBounds) else {
+                return .refuse(reason: outsideBoundsRefusalReason)
+            }
         }
 
         // Only an action has an action name. A property write has no entry in
@@ -155,6 +224,21 @@ enum ActionSafetyKernel {
         if let requiredActionName = intent.action.accessibilityActionName {
             guard resolvedNode.publishedActionNames.contains(requiredActionName) else {
                 return .refuse(reason: "element does not publish \(requiredActionName)")
+            }
+        }
+
+        // The one fact a menu item publishes that decides everything, and the
+        // one an AXError cannot tell you afterwards.
+        if case .menu = intent.action {
+            // No answer means nobody asked, which is our bug and not a
+            // question for a human — same rule as a missing typing context.
+            guard let menuItemEnabled else {
+                return .refuse(reason: "no enabled state was read for this menu item")
+            }
+            guard menuItemEnabled else {
+                return .refuse(reason: menuItemDisabledRefusalReason(
+                    name: resolvedNode.displayName?.forDisplay ?? "?"
+                ))
             }
         }
 

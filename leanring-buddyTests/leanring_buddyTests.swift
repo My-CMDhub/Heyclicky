@@ -1258,3 +1258,265 @@ private let wholeScreen = CGRect(x: 0, y: 0, width: 1920, height: 1200)
     )
     #expect(injectionShaped == .securityRefusal)
 }
+
+// MARK: - The menu bar: the app's other tree
+//
+// Everything below is the pure half. The cross-process half — that pressing a
+// menu item works with the menu closed, and what frame a closed item reports —
+// is proven by running it against Finder over the socket, never by a mock.
+
+/// Finder's File menu, as measured: a single `AXMenu` wrapper under the menu
+/// bar item, submenus populated without being opened, one disabled item, and a
+/// deliberately duplicated label.
+private func fileMenuBarFixture() -> AccessibilityMenu.Node {
+    AccessibilityMenu.Node(label: nil, role: "AXMenuBar", children: [
+        AccessibilityMenu.Node(label: "File", role: "AXMenuBarItem", children: [
+            AccessibilityMenu.Node(label: nil, role: "AXMenu", children: [
+                AccessibilityMenu.Node(label: "New Finder Window", role: "AXMenuItem", shortcut: "⌘N"),
+                AccessibilityMenu.Node(label: "New Folder", role: "AXMenuItem", isEnabled: false, shortcut: "⇧⌘N"),
+                AccessibilityMenu.Node(label: "Open With", role: "AXMenuItem", children: [
+                    AccessibilityMenu.Node(label: nil, role: "AXMenu", children: [
+                        AccessibilityMenu.Node(label: "TextEdit", role: "AXMenuItem")
+                    ])
+                ]),
+                AccessibilityMenu.Node(label: "Close Window", role: "AXMenuItem"),
+                AccessibilityMenu.Node(label: "Close Window", role: "AXMenuItem")
+            ])
+        ])
+    ])
+}
+
+@Test func aMenuPathStepsThroughTheAXMenuWrapperItNeverNames() async throws {
+    let (node, resolution) = AccessibilityMenu.resolveNode(
+        path: ["File", "Open With", "TextEdit"],
+        from: fileMenuBarFixture(),
+        children: { $0.children }
+    )
+
+    // The path names File > Open With > TextEdit. The tree has an AXMenu
+    // between every pair of those, and nobody has to know that.
+    #expect(node?.label == "TextEdit")
+    #expect(resolution == .resolved(label: "TextEdit", role: "AXMenuItem", isEnabled: true))
+}
+
+@Test func aPathStepMatchingTwoItemsIsRefusedRatherThanTakingTheFirst() async throws {
+    let (node, resolution) = AccessibilityMenu.resolveNode(
+        path: ["File", "Close Window"],
+        from: fileMenuBarFixture(),
+        children: { $0.children }
+    )
+
+    #expect(node == nil)
+    #expect(resolution == .ambiguous(atStep: 1, step: "Close Window", matchCount: 2))
+}
+
+@Test func aMissingPathStepReportsWhatWasActuallyAtThatLevel() async throws {
+    let (_, resolution) = AccessibilityMenu.resolveNode(
+        path: ["File", "New Fodler"],
+        from: fileMenuBarFixture(),
+        children: { $0.children }
+    )
+
+    // The labels are the whole point of the failure: without them the caller
+    // cannot tell a typo from a menu that is not there.
+    guard case .notFound(let atStep, let step, let available) = resolution else {
+        Issue.record("expected notFound, got \(resolution)")
+        return
+    }
+    #expect(atStep == 1)
+    #expect(step == "New Fodler")
+    #expect(available.contains("New Finder Window"))
+    #expect(available.contains("New Folder"))
+}
+
+/// The wrapper is not a step. A caller that names it is wrong, and being told
+/// so beats resolving to the menu itself.
+@Test func theAXMenuWrapperIsNotItselfAPathStep() async throws {
+    let (node, resolution) = AccessibilityMenu.resolveNode(
+        path: ["File", "AXMenu"],
+        from: fileMenuBarFixture(),
+        children: { $0.children }
+    )
+    #expect(node == nil)
+    if case .notFound = resolution {} else { Issue.record("expected notFound, got \(resolution)") }
+}
+
+@Test func aDisabledMenuItemIsRefusedByNameBeforeAnythingIsPressed() async throws {
+    // Every menu item publishes AXPress whether or not it does anything, so the
+    // action list cannot tell these apart — AXEnabled can, and only before.
+    let disabled = AccessibilityElementNode(
+        role: "AXMenuItem", subrole: nil, title: "New Folder", value: nil,
+        frameInAppKitCoordinates: .zero, depth: 0, children: [],
+        publishedActionNames: ["AXCancel", "AXPress", "AXPick"]
+    )
+    let intent = ElementActionIntent(role: nil, title: "New Folder", action: .menu)
+
+    let refused = ActionSafetyKernel.evaluate(
+        intent: intent, resolvedNode: disabled, matchCount: 1,
+        visibleBounds: .infinite, menuItemEnabled: false
+    )
+    #expect(refused == .refuse(reason: ActionSafetyKernel.menuItemDisabledRefusalReason(
+        name: "\"New Folder\""
+    )))
+
+    // Same element, same zero frame — enabled, and now allowed. The zero frame
+    // is the point: a closed menu item has no on-screen rectangle, and the
+    // frame checks that would refuse it do not apply to this verb.
+    let allowed = ActionSafetyKernel.evaluate(
+        intent: intent, resolvedNode: disabled, matchCount: 1,
+        visibleBounds: .infinite, menuItemEnabled: true
+    )
+    #expect(allowed == .allow)
+}
+
+@Test func aMenuItemWhoseStateWasNeverReadIsOurBugNotAQuestion() async throws {
+    let item = AccessibilityElementNode(
+        role: "AXMenuItem", subrole: nil, title: "New Folder", value: nil,
+        frameInAppKitCoordinates: .zero, depth: 0, children: [],
+        publishedActionNames: ["AXPress"]
+    )
+    let decision = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "New Folder", action: .menu),
+        resolvedNode: item, matchCount: 1, visibleBounds: .infinite
+    )
+    #expect(decision == .refuse(reason: "no enabled state was read for this menu item"))
+}
+
+@Test func theMenuBarsOwnDestructiveWordsStillStopAtAQuestion() async throws {
+    for label in ["Empty Trash", "Quit Finder", "Move to Bin", "Eject"] {
+        let item = AccessibilityElementNode(
+            role: "AXMenuItem", subrole: nil, title: label, value: nil,
+            frameInAppKitCoordinates: .zero, depth: 0, children: [],
+            publishedActionNames: ["AXPress"]
+        )
+        let decision = ActionSafetyKernel.evaluate(
+            intent: ElementActionIntent(role: nil, title: label, action: .menu),
+            resolvedNode: item, matchCount: 1, visibleBounds: .infinite,
+            menuItemEnabled: true
+        )
+        guard case .requireConfirmation(let reason) = decision else {
+            Issue.record("\(label) should have asked, got \(decision)")
+            continue
+        }
+        #expect(reason.hasPrefix("title suggests a destructive action:"))
+    }
+}
+
+// MARK: - Menu shortcuts: the mask where Command is encoded by its absence
+
+@Test func theModifierMaskDecodesCommandFromTheBitThatSaysThereIsNoCommand() async throws {
+    // Mask 0 — the value that looks most like "no modifiers" — is ⌘.
+    #expect(AccessibilityMenu.describeShortcut(character: "n", modifiers: 0) == "⌘N")
+    #expect(AccessibilityMenu.describeShortcut(character: "n", modifiers: 1) == "⇧⌘N")
+    #expect(AccessibilityMenu.describeShortcut(character: "n", modifiers: 2) == "⌥⌘N")
+    #expect(AccessibilityMenu.describeShortcut(character: "n", modifiers: 4) == "⌃⌘N")
+    // Bit 3 set means "no Command" — the only way to say a shortcut without one.
+    #expect(AccessibilityMenu.describeShortcut(character: "n", modifiers: 8) == "N")
+    // Apple's display order is ⌃⌥⇧⌘, not the bit order.
+    #expect(AccessibilityMenu.describeShortcut(character: "n", modifiers: 1 | 2 | 4) == "⌃⌥⇧⌘N")
+}
+
+@Test func aShortcutWithNoCharacterIsNilAndAControlCharacterIsReadable() async throws {
+    #expect(AccessibilityMenu.describeShortcut(character: nil, modifiers: 0) == nil)
+    #expect(AccessibilityMenu.describeShortcut(character: "", modifiers: 0) == nil)
+    // A raw \u{8} in a response is not "readable", which is this field's job.
+    #expect(AccessibilityMenu.describeShortcut(character: "\u{8}", modifiers: 0) == "⌘⌫")
+}
+
+// MARK: - open: the verb Finder actually answers to
+
+@Test func openIsAXOpenAndIsRefusedForSomethingThatDoesNotPublishIt() async throws {
+    #expect(ElementAction.open.accessibilityActionName == "AXOpen")
+
+    let frame = CGRect(x: 10, y: 10, width: 200, height: 20)
+    let intent = ElementActionIntent(role: nil, title: "notes.txt", action: .open)
+
+    let cell = AccessibilityElementNode(
+        role: "AXCell", subrole: nil, title: "notes.txt", value: nil,
+        frameInAppKitCoordinates: frame, depth: 0, children: [],
+        publishedActionNames: ["AXOpen", "AXShowMenu"]
+    )
+    // Not .allow: opening launches whatever the thing is, so the kernel asks.
+    // See `navigationalOpenRoles` and the role census behind it.
+    guard case .requireConfirmation = ActionSafetyKernel.evaluate(
+        intent: intent, resolvedNode: cell, matchCount: 1, visibleBounds: frame
+    ) else {
+        Issue.record("opening a cell that publishes AXOpen should ask, not allow")
+        return
+    }
+
+    // Finder's "Favourites" section header is a real cell that publishes no
+    // actions at all — a built-in true negative, not a hypothetical.
+    let header = AccessibilityElementNode(
+        role: "AXCell", subrole: nil, title: "Favourites", value: nil,
+        frameInAppKitCoordinates: frame, depth: 0, children: [],
+        publishedActionNames: []
+    )
+    #expect(ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Favourites", action: .open),
+        resolvedNode: header, matchCount: 1, visibleBounds: frame
+    ) == .refuse(reason: "element does not publish AXOpen"))
+}
+
+// MARK: - Menu verbs on the wire
+
+@Test func aMenuRequestWithoutAPathIsAMissingFieldNotTheWholeMenuBar() async throws {
+    switch HarnessPolicy.decode(line: #"{"id":"1","verb":"menu"}"#) {
+    case .failure(let error):
+        #expect(error == .missingField("path"))
+    case .success(let request):
+        Issue.record("should have refused, decoded \(request)")
+    }
+
+    // A listing without a prefix is the whole bar, which is a legitimate ask.
+    switch HarnessPolicy.decode(line: #"{"id":"2","verb":"menus"}"#) {
+    case .failure(let error):
+        Issue.record("menus needs no path, got \(error)")
+    case .success(let request):
+        #expect(request.path.isEmpty)
+        #expect(request.verb.isMutating == false)
+    }
+}
+
+@Test func aMenuPathBecomesTheAuditLinesTargetSoTheLogSaysWhatWasPressed() async throws {
+    guard case .success(let request) = HarnessPolicy.decode(
+        line: #"{"id":"3","verb":"menu","path":["File","New Folder"]}"#
+    ) else {
+        Issue.record("should have decoded")
+        return
+    }
+    #expect(request.path == ["File", "New Folder"])
+    #expect(request.title == "File > New Folder")
+    #expect(request.verb.isMutating)
+}
+
+@Test func theKillSwitchStopsAMenuPressAndLeavesTheListingAlone() async throws {
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .menu, killSwitchPresent: true) != nil)
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .open, killSwitchPresent: true) != nil)
+    // Reading what an app can do is how an operator finds out why they tripped it.
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .menus, killSwitchPresent: true) == nil)
+}
+
+@Test func openingAlwaysAsksAHumanNoMatterTheRole() async throws {
+    // AXOpen launches whatever the thing is. Measured 2026-09-10 in Finder:
+    // 446 named AXTextFields publish it (the file list). Auto-allowing the
+    // majority role would only decide which launches happen without asking.
+    func openable(role: String) -> AccessibilityElementNode {
+        AccessibilityElementNode(
+            role: role, subrole: nil, title: "Installer", value: nil,
+            frameInAppKitCoordinates: CGRect(x: 10, y: 10, width: 200, height: 20),
+            depth: 3, children: [], publishedActionNames: ["AXOpen"]
+        )
+    }
+    let bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
+    for role in ["AXTextField", "AXCell", "AXRow", "AXStaticText"] {
+        let decision = ActionSafetyKernel.evaluate(
+            intent: ElementActionIntent(role: nil, title: "Installer", action: .open),
+            resolvedNode: openable(role: role), matchCount: 1, visibleBounds: bounds
+        )
+        guard case .requireConfirmation = decision else {
+            Issue.record("opening a \(role) should ask, got \(decision)")
+            return
+        }
+    }
+}

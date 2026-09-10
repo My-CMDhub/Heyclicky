@@ -38,6 +38,9 @@ struct HarnessRawRequest: Decodable {
     let dryRun: Bool?
     let confirmed: Bool?
 
+    /// menu / menus only: the path down the menu bar, e.g. ["File", "New Folder"].
+    let path: [String]?
+
     // type only
     let text: String?
     let mode: String?
@@ -58,14 +61,22 @@ enum HarnessVerb: String, CaseIterable {
     case press
     case select
     case type
+    case open
+
+    /// Press a menu item by its path down the menu bar.
+    case menu
+    /// List what the menu bar currently offers. Read-only, and its own verb
+    /// because a full listing costs 0.3-1.6 s — folding it into `snapshot`
+    /// would put that on every read.
+    case menus
 
     /// Whether this verb can change the world. The kill switch stops these and
     /// leaves the read-only pair working, so an operator who tripped it can
     /// still look at the machine and find out why.
     var isMutating: Bool {
         switch self {
-        case .ping, .snapshot: return false
-        case .press, .select, .type: return true
+        case .ping, .snapshot, .menus: return false
+        case .press, .select, .type, .open, .menu: return true
         }
     }
 
@@ -74,7 +85,12 @@ enum HarnessVerb: String, CaseIterable {
         case .press: return .press
         case .select: return .select
         case .type: return .type
-        case .ping, .snapshot: return nil
+        case .open: return .open
+        // `menu` acts, but it does not resolve a name in the focused window, so
+        // it does not go through the name-resolving path at all. Returning nil
+        // here is what keeps the "an acting verb needs a title" rule honest —
+        // a menu request carries a path instead.
+        case .ping, .snapshot, .menu, .menus: return nil
         }
     }
 }
@@ -135,6 +151,9 @@ struct HarnessRequest: Equatable {
     /// Aim at whatever holds keyboard focus instead of resolving a name.
     var aimAtFocus: Bool = false
     var thenConfirm: Bool = false
+
+    /// menu / menus only.
+    var path: [String] = []
 }
 
 // MARK: - Pure decision logic
@@ -180,6 +199,13 @@ enum HarnessPolicy {
             return .failure(.missingField("title"))
         }
 
+        // A menu path is that verb's whole aim, so an empty one is a missing
+        // field rather than "the menu bar itself".
+        let path = raw.path ?? []
+        if verb == .menu, path.isEmpty {
+            return .failure(.missingField("path"))
+        }
+
         var mode = TypeMode.insert
         if verb == .type {
             guard !(raw.text ?? "").isEmpty else {
@@ -196,7 +222,12 @@ enum HarnessPolicy {
         return .success(HarnessRequest(
             id: raw.id ?? "",
             verb: verb,
-            title: raw.title ?? "",
+            // The audit line's `target` is the title, and for a menu the path
+            // IS the target. One joined string keeps the log readable without
+            // a second field only two verbs would ever set.
+            title: (verb == .menu || verb == .menus) && !path.isEmpty
+                ? path.joined(separator: " > ")
+                : (raw.title ?? ""),
             role: raw.role,
             withinNamed: raw.withinNamed,
             nearPoint: raw.nearPoint?.cgPoint,
@@ -205,7 +236,8 @@ enum HarnessPolicy {
             text: raw.text ?? "",
             mode: mode,
             aimAtFocus: aimAtFocus,
-            thenConfirm: raw.thenConfirm ?? false
+            thenConfirm: raw.thenConfirm ?? false,
+            path: path
         ))
     }
 
@@ -795,8 +827,14 @@ final class HarnessServer {
         case .snapshot:
             return snapshotResponse(request, dryRun: dryRun, startedAt: startedAt)
 
-        case .press, .select, .type:
+        case .press, .select, .type, .open:
             return actResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .menu:
+            return menuResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .menus:
+            return menusResponse(request, dryRun: dryRun, startedAt: startedAt)
         }
     }
 
@@ -985,14 +1023,16 @@ final class HarnessServer {
 
         let performedOK: Bool
         switch action {
-        case .press:
+        case .press, .open, .menu:
             guard let element = resolvedNode.accessibilityElement else {
                 response["ok"] = false
                 response["error"] = "noLiveElement"
                 audit(request, dryRun: dryRun, kernel: described.decision, outcome: "noLiveElement", startedAt: startedAt)
                 return response
             }
-            let result = AccessibilityActionPerformer.perform(kAXPressAction, on: element)
+            let result = AccessibilityActionPerformer.perform(
+                action.accessibilityActionName ?? kAXPressAction, on: element
+            )
             // Print the raw code AND the clock: -25204 in 2 ms is the app
             // refusing, -25204 at 5,000 ms is our own timeout firing. Same
             // number, opposite problems.
@@ -1142,6 +1182,288 @@ final class HarnessServer {
             audit(request, dryRun: dryRun, kernel: described.decision, outcome: "couldNotReadWindow", startedAt: startedAt)
         }
 
+        return response
+    }
+
+    // MARK: menu / menus
+
+    // Both menu verbs report their timing as `menuMilliseconds`, and never as
+    // `walkMilliseconds`.
+    //
+    // The slow-walk anomaly rule keeps a per-app median of *window* walk
+    // durations. A menu read is a different population entirely — Finder's
+    // window walks in ~112 ms and its menu bar takes 545 ms — so a menu request
+    // would both fire the rule and drag the median it is compared against,
+    // which is exactly how the cross-app ring poisoned itself before it was
+    // keyed per app. `observe` reads only `walkMilliseconds`, so a different
+    // key is the whole fix, and menu timings stay visible in the response.
+
+    /// The frontmost app and its menu bar, or nil having already filled in the
+    /// refusal and written the audit line.
+    private func menuBar(
+        for request: HarnessRequest,
+        dryRun: Bool,
+        startedAt: Date,
+        into response: inout [String: Any]
+    ) -> (application: NSRunningApplication, bar: AccessibilityMenu.Node)? {
+
+        func fail(_ code: String, _ message: String) {
+            response["ok"] = false
+            response["error"] = code
+            response["message"] = message
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: code, startedAt: startedAt)
+        }
+
+        guard let application = NSWorkspace.shared.frontmostApplication else {
+            fail("noFrontmostApplication", "nothing is frontmost")
+            return nil
+        }
+        // Same guard the walker has. A locked screen makes loginwindow
+        // frontmost, and its menu bar is a believable, wrong answer.
+        guard !LockScreenGuard.isLockScreen(application.bundleIdentifier) else {
+            fail("screenIsLocked", "the screen is locked — there is no menu bar of the user's to read")
+            return nil
+        }
+        response["application"] = application.localizedName ?? "unknown"
+        response["bundleIdentifier"] = application.bundleIdentifier ?? "unknown"
+
+        guard let bar = AccessibilityMenu.menuBarNode(for: application) else {
+            fail("noMenuBar", "the application publishes no AXMenuBar")
+            return nil
+        }
+        return (application, bar)
+    }
+
+    /// The wire form of a failed path step, or nil when it resolved.
+    private static func menuResolutionFailure(
+        _ resolution: AccessibilityMenu.Resolution
+    ) -> (code: String, payload: [String: Any])? {
+        switch resolution {
+        case .resolved:
+            return nil
+        case .notFound(let atStep, let step, let available):
+            return ("notFound", [
+                "status": "notFound",
+                "atStep": atStep,
+                "step": step,
+                // What WAS at that level. Without this a miss is not actionable:
+                // the caller cannot tell a typo from a menu that is not there.
+                "available": available.map { UntrustedText($0).forDisplay }
+            ])
+        case .ambiguous(let atStep, let step, let matchCount):
+            return ("ambiguous", [
+                "status": "ambiguous", "atStep": atStep, "step": step, "matchCount": matchCount
+            ])
+        case .emptyPath:
+            return ("missingField", ["status": "emptyPath"])
+        }
+    }
+
+    private func menuResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        var response: [String: Any] = [
+            "dryRun": dryRun, "confirmed": request.confirmed, "path": request.path
+        ]
+        guard let (application, bar) = menuBar(
+            for: request, dryRun: dryRun, startedAt: startedAt, into: &response
+        ) else { return response }
+
+        // Only the path is read — six or seven levels, not the 300-item bar.
+        let resolveStartedAt = Date()
+        let (node, resolution) = AccessibilityMenu.resolveNode(
+            path: request.path, from: bar, children: AccessibilityMenu.liveChildren
+        )
+        response["menuMilliseconds"] = Int(Date().timeIntervalSince(resolveStartedAt) * 1000)
+
+        if let failure = Self.menuResolutionFailure(resolution) {
+            response["resolution"] = failure.payload
+            response["ok"] = false
+            response["error"] = failure.code
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: failure.code, startedAt: startedAt)
+            return response
+        }
+        guard let node else {
+            response["ok"] = false
+            response["error"] = "notFound"
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
+            return response
+        }
+
+        let resolvedNode = AccessibilityMenu.elementNode(for: node)
+        response["resolution"] = [
+            "status": "resolved", "matchCount": 1,
+            "enabled": node.isEnabled,
+            "shortcut": (node.shortcut ?? NSNull()) as Any
+        ]
+        response["resolved"] = Self.summarise(resolvedNode)
+
+        let intent = ElementActionIntent(role: nil, title: node.label ?? "", action: .menu)
+        let decision = ActionSafetyKernel.evaluate(
+            intent: intent,
+            resolvedNode: resolvedNode,
+            matchCount: 1,
+            // A closed menu item is not drawn, so there are no visible bounds
+            // for it to be inside. `.infinite` says that honestly: the frame
+            // checks do not run for `.menu`, and if they ever did again, a
+            // degenerate frame would still be refused while a real one passes.
+            visibleBounds: .infinite,
+            menuItemEnabled: node.isEnabled
+        )
+        let described = HarnessPolicy.describe(decision)
+        let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
+        response["kernel"] = [
+            "decision": described.decision,
+            "reason": (described.reason ?? NSNull()) as Any,
+            "executable": executability.executable,
+            "note": (executability.reason ?? NSNull()) as Any
+        ]
+
+        guard executability.executable else {
+            response["ok"] = false
+            response["error"] = described.decision == "refuse" ? "kernelRefused" : "confirmationRequired"
+            audit(request, dryRun: dryRun, kernel: described.decision,
+                  outcome: described.decision == "refuse" ? "kernelRefused" : "confirmationRequired",
+                  startedAt: startedAt)
+            return response
+        }
+
+        guard !dryRun else {
+            response["ok"] = true
+            response["performed"] = ["status": "skipped", "reason": "dry run — nothing was performed"]
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "dryRun", startedAt: startedAt)
+            return response
+        }
+
+        guard let element = resolvedNode.accessibilityElement else {
+            response["ok"] = false
+            response["error"] = "noLiveElement"
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "noLiveElement", startedAt: startedAt)
+            return response
+        }
+
+        // Two independent baselines, because either one alone is blind here.
+        // The named-element fingerprint cannot see `File > New Finder Window` —
+        // two Finder windows on the same folder publish the same names — and
+        // the window count cannot see anything that is not a window.
+        let windowsBefore = AccessibilityMenu.windowCount(for: application)
+        let namesBefore = (try? AccessibilityTreeWalker.snapshotFocusedWindow())?
+            .rootNode.map(AccessibilityDumpRunner.namedElementFingerprint)
+        response["windowsBefore"] = (windowsBefore ?? NSNull()) as Any
+
+        // Pressing works with the menu **closed**, and leaves nothing open on
+        // screen. Measured 2026-09-10 over this socket: File > New Finder Window
+        // returned AXError 0 and took Finder from 2 AX windows to 3, and
+        // `AXSelected` on all eight of Finder's menu bar items read false both
+        // before and after — no menu was opened, so none had to be dismissed.
+        let result = AccessibilityActionPerformer.perform(kAXPressAction, on: element)
+        response["performed"] = [
+            "status": result.error == .success ? "sent" : "failed",
+            "axErrorRawValue": result.error.rawValue,
+            "milliseconds": result.milliseconds
+        ]
+        guard result.error == .success else {
+            response["ok"] = false
+            response["error"] = "performFailed"
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "performFailed", startedAt: startedAt)
+            return response
+        }
+
+        let verification = ActionVerifier.verify { laterSnapshot in
+            if let windowsBefore,
+               AccessibilityMenu.windowCount(for: application) != windowsBefore { return true }
+            guard let laterRoot = laterSnapshot.rootNode, let namesBefore else { return false }
+            return AccessibilityDumpRunner.namedElementFingerprint(in: laterRoot) != namesBefore
+        }
+
+        switch verification {
+        case .confirmed(let milliseconds):
+            response["verification"] = [
+                "status": "confirmed",
+                "milliseconds": milliseconds,
+                "windowsAfter": (AccessibilityMenu.windowCount(for: application) ?? NSNull()) as Any
+            ]
+            response["ok"] = true
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "confirmed", startedAt: startedAt)
+        case .notObserved(let milliseconds):
+            response["verification"] = [
+                "status": "notObserved",
+                "milliseconds": milliseconds,
+                "windowsAfter": (AccessibilityMenu.windowCount(for: application) ?? NSNull()) as Any
+            ]
+            response["ok"] = false
+            response["error"] = "notVerified"
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "notObserved", startedAt: startedAt)
+        case .couldNotReadWindow:
+            response["verification"] = ["status": "couldNotReadWindow"]
+            response["ok"] = false
+            response["error"] = "notVerified"
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "couldNotReadWindow", startedAt: startedAt)
+        }
+        return response
+    }
+
+    /// The list of what this app can currently be asked to do.
+    ///
+    /// A screenshot structurally cannot provide it — a closed menu shows
+    /// nothing — and it is the thing a planner needs before it can plan.
+    private func menusResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        var response: [String: Any] = ["pathPrefix": request.path]
+        guard let (_, bar) = menuBar(
+            for: request, dryRun: dryRun, startedAt: startedAt, into: &response
+        ) else { return response }
+
+        // The prefix genuinely scopes the read: resolve it one level at a time,
+        // then enumerate from there. Never list 591 items and filter.
+        var startNode = bar
+        if !request.path.isEmpty {
+            let (node, resolution) = AccessibilityMenu.resolveNode(
+                path: request.path, from: bar, children: AccessibilityMenu.liveChildren
+            )
+            if let failure = Self.menuResolutionFailure(resolution) {
+                response["resolution"] = failure.payload
+                response["ok"] = false
+                response["error"] = failure.code
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: failure.code, startedAt: startedAt)
+                return response
+            }
+            guard let node else {
+                response["ok"] = false
+                response["error"] = "notFound"
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
+                return response
+            }
+            startNode = node
+        }
+
+        let listing = AccessibilityMenu.list(
+            from: startNode,
+            pathSoFar: request.path,
+            children: AccessibilityMenu.liveChildren,
+            deadline: Date().addingTimeInterval(AccessibilityMenu.listingTimeLimitInSeconds)
+        )
+
+        // Truncation is a banner above the counts, never a flag beside them.
+        if !listing.stopReasons.isEmpty {
+            response["warning"] = "THESE COUNTS ARE A FLOOR, NOT A MEASUREMENT — the listing stopped early: "
+                + listing.stopReasons.joined(separator: ", ")
+        }
+        response["listingStopReasons"] = listing.stopReasons
+        response["menuMilliseconds"] = listing.milliseconds
+        response["itemCount"] = listing.items.count
+        response["enabledCount"] = listing.items.filter(\.isEnabled).count
+        response["withShortcutCount"] = listing.items.filter { $0.shortcut != nil }.count
+        // Paths are raw so a caller can feed one straight back into `menu`.
+        // JSON encoding is the escaping, exactly as in `summarise`.
+        response["items"] = listing.items.map {
+            [
+                "path": $0.path,
+                "role": $0.role,
+                "enabled": $0.isEnabled,
+                "shortcut": $0.shortcut ?? NSNull(),
+                "hasSubmenu": $0.hasSubmenu
+            ] as [String: Any]
+        }
+        response["ok"] = true
+        audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ok", startedAt: startedAt)
         return response
     }
 
