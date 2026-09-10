@@ -1759,3 +1759,213 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
     #expect(ActionSafetyKernel.evaluateFocus(windowTitle: UntrustedText(""), matchCount: 2)
         == .refuse(reason: "2 windows match that title"))
 }
+
+// MARK: - Phase 4: the escalation ladder
+//
+// Pure geometry and pure policy only. The capture itself is a cross-process
+// call into ScreenCaptureKit, and a mock of it would test the mock.
+
+@Test func theSourceRectConversionFlipsIntoDisplayRelativeTopLeftCoordinates() async throws {
+    // AppKit: bottom-left origin, y up, global across displays.
+    // sourceRect: top-left origin, y down, relative to the display's own origin.
+    // Skip this and the crop is mirrored about the display's centre — plausible
+    // on a full-screen window, and a photograph of the menu bar on a toolbar button.
+    let primary = CGRect(x: 0, y: 0, width: 1920, height: 1200)
+
+    // A rect 900 pt up from the bottom, 200 tall: its top edge is 100 pt down
+    // from the top of a 1200 pt display.
+    #expect(EscalationLadder.sourceRect(
+        forAppKitRect: CGRect(x: 100, y: 900, width: 300, height: 200),
+        onDisplayWithAppKitFrame: primary
+    ) == CGRect(x: 100, y: 100, width: 300, height: 200))
+
+    // Flush with the bottom of the display is flush with the *bottom* of the
+    // source rect too — y = 1200 - 50 = 1150, not 0.
+    #expect(EscalationLadder.sourceRect(
+        forAppKitRect: CGRect(x: 0, y: 0, width: 1920, height: 50),
+        onDisplayWithAppKitFrame: primary
+    ) == CGRect(x: 0, y: 1150, width: 1920, height: 50))
+
+    // The whole display maps to the whole display.
+    #expect(EscalationLadder.sourceRect(forAppKitRect: primary, onDisplayWithAppKitFrame: primary)
+        == CGRect(origin: .zero, size: primary.size))
+
+    // A secondary display sitting to the right and below the primary origin —
+    // the case where a global-vs-relative mistake stops being invisible.
+    let secondary = CGRect(x: 1920, y: -300, width: 1920, height: 1080)
+    #expect(EscalationLadder.sourceRect(
+        forAppKitRect: CGRect(x: 2020, y: 500, width: 100, height: 50),
+        onDisplayWithAppKitFrame: secondary
+    ) == CGRect(x: 100, y: 230, width: 100, height: 50))
+}
+
+@Test func theTierIsChosenByWhatIsActuallyUsableAndSaysWhichConditionDecided() async throws {
+    let window = CGRect(x: 100, y: 100, width: 800, height: 600)
+    let candidate = CGRect(x: 200, y: 200, width: 60, height: 30)
+
+    // Rung 2: something matched the name, so the region is their union padded.
+    let element = EscalationLadder.chooseTier(
+        forcedTier: nil, candidateFrames: [candidate], windowFrame: window, windowActionableCount: 40
+    )
+    #expect(element.tier == .element)
+    #expect(element.reason.contains("padded 24 pt"))
+
+    // Rung 3: nothing matched, but the window is worth cropping to.
+    let usable = EscalationLadder.chooseTier(
+        forcedTier: nil, candidateFrames: [], windowFrame: window, windowActionableCount: 40
+    )
+    #expect(usable.tier == .window)
+    #expect(usable.reason.contains("40 actionable"))
+
+    // Rung 4, three ways — and the reason has to name WHICH one, because
+    // "0 actionable descendants" is a finding and "fell through" is not.
+    let noRoot = EscalationLadder.chooseTier(
+        forcedTier: nil, candidateFrames: [], windowFrame: nil, windowActionableCount: 0
+    )
+    #expect(noRoot.tier == .display)
+    #expect(noRoot.reason.contains("no focused-window root node"))
+
+    let zeroArea = EscalationLadder.chooseTier(
+        forcedTier: nil, candidateFrames: [], windowFrame: .zero, windowActionableCount: 40
+    )
+    #expect(zeroArea.tier == .display)
+    #expect(zeroArea.reason.contains("zero area"))
+
+    // The fall-through that matters: a window that reads fine and publishes
+    // nothing to act on. Cropping to it photographs a window nothing can be
+    // done in, which is exactly when a caller needs the rest of the screen.
+    let nothingActionable = EscalationLadder.chooseTier(
+        forcedTier: nil, candidateFrames: [], windowFrame: window, windowActionableCount: 0
+    )
+    #expect(nothingActionable.tier == .display)
+    #expect(nothingActionable.reason.contains("0 actionable"))
+
+    // A forced rung wins over all of it, and says so.
+    let forced = EscalationLadder.chooseTier(
+        forcedTier: .display, candidateFrames: [candidate], windowFrame: window, windowActionableCount: 40
+    )
+    #expect(forced.tier == .display)
+    #expect(forced.reason.contains("the caller asked for"))
+
+    // A zero-area candidate frame is not a region. A scrolled-out sidebar row
+    // reads (0, 0, 0, 0) with a perfectly good name, and one of those in the
+    // union drags the crop to the corner of the screen.
+    #expect(EscalationLadder.region(forCandidateFrames: [.zero]) == nil)
+    #expect(EscalationLadder.chooseTier(
+        forcedTier: nil, candidateFrames: [.zero], windowFrame: window, windowActionableCount: 40
+    ).tier == .window)
+}
+
+@Test func aSeparatingPointIsFoundOrHonestlySaidToBeAbsent() async throws {
+    // Two real Finder windows, measured 2026-09-10, both titled "Recent".
+    // They overlap almost entirely: the only regions that separate them are
+    // 29 pt strips along two edges.
+    let leftWindow = CGRect(x: 260, y: 329, width: 920, height: 436)
+    let rightWindow = CGRect(x: 289, y: 300, width: 920, height: 436)
+    let recent = [leftWindow, rightWindow]
+
+    // The centre of each lies inside the other, so the first and cheapest
+    // point in the search decides nothing.
+    #expect(rightWindow.contains(CGPoint(x: leftWindow.midX, y: leftWindow.midY)))
+    #expect(leftWindow.contains(CGPoint(x: rightWindow.midX, y: rightWindow.midY)))
+
+    // But the strips ARE reachable, and finding them is the whole job. A 5x5
+    // grid inset 10% insets by 92 pt horizontally and steps over a 29 pt strip;
+    // cutting the frame at the other window's own edges cannot, because the
+    // strip is bounded by exactly those edges. Both windows separate.
+    let left = try #require(EscalationLadder.separatingPoint(forCandidateAt: 0, among: recent))
+    #expect(leftWindow.contains(left))
+    #expect(!rightWindow.contains(left))
+
+    let right = try #require(EscalationLadder.separatingPoint(forCandidateAt: 1, among: recent))
+    #expect(rightWindow.contains(right))
+    #expect(!leftWindow.contains(right))
+
+    // Genuinely unseparable: one frame wholly inside another. There is no point
+    // in the inner one that is outside the outer, so the answer is nil — never
+    // a "nearest", which always returns something, and something is what a
+    // wrong click looks like.
+    let outer = CGRect(x: 0, y: 0, width: 500, height: 500)
+    let inner = CGRect(x: 100, y: 100, width: 200, height: 200)
+    #expect(EscalationLadder.separatingPoint(forCandidateAt: 1, among: [outer, inner]) == nil)
+
+    // Two windows that merely touch: the centre separates them at once, and
+    // the point returned must be inside its own candidate and outside the other.
+    let a = CGRect(x: 100, y: 100, width: 400, height: 300)
+    let b = CGRect(x: 400, y: 100, width: 400, height: 300)
+    let point = try #require(EscalationLadder.separatingPoint(forCandidateAt: 0, among: [a, b]))
+    #expect(a.contains(point))
+    #expect(!b.contains(point))
+
+    // The centre fails, a cell midpoint succeeds.
+    let c = CGRect(x: 0, y: 0, width: 400, height: 400)
+    let d = CGRect(x: 100, y: 0, width: 400, height: 400)
+    #expect(d.contains(CGPoint(x: c.midX, y: c.midY)))
+    let reached = try #require(EscalationLadder.separatingPoint(forCandidateAt: 0, among: [c, d]))
+    #expect(c.contains(reached))
+    #expect(!d.contains(reached))
+
+    // One candidate on its own is separated by its own centre.
+    #expect(EscalationLadder.separatingPoint(forCandidateAt: 0, among: [a]) == CGPoint(x: a.midX, y: a.midY))
+    // A zero-area candidate has no interior to point at.
+    #expect(EscalationLadder.separatingPoint(forCandidateAt: 0, among: [.zero]) == nil)
+}
+
+@Test func aRegionHoldingASecureFieldIsNotPhotographed() async throws {
+    // The crop taken to disambiguate a button is still a picture of everything
+    // else in the rectangle. A screenshot of a password field is a credential
+    // on disk, and no later refusal takes it back.
+    let refusal = ActionSafetyKernel.evaluateCapture(elementsInRegion: [
+        typingNode(role: "AXButton", name: "Sign In"),
+        typingNode(role: "AXTextField", subrole: "AXSecureTextField", name: "Password")
+    ])
+    guard case .refuse(let reason) = refusal else {
+        Issue.record("a secure field in the region must be refused, got \(refusal)")
+        return
+    }
+    #expect(reason.hasPrefix("refusing to capture a region containing a secure field"))
+    // Something tried to photograph a password field: that is the shape of an
+    // attempt, so it earns the last twenty requests on disk.
+    #expect(ActionSafetyKernel.isSecurityRefusal(reason: reason))
+
+    #expect(ActionSafetyKernel.evaluateCapture(elementsInRegion: [
+        typingNode(role: "AXButton", name: "Sign In"),
+        typingNode(role: "AXTextField", name: "Email")
+    ]) == .allow)
+    #expect(ActionSafetyKernel.evaluateCapture(elementsInRegion: []) == .allow)
+}
+
+@Test func anUnrecognisedTierIsRejectedRatherThanIgnored() async throws {
+    // Same rule as `mode` and `target`: a near-miss silently ignored would hand
+    // the caller a rung it did not ask for.
+    #expect(HarnessPolicy.decode(line: #"{"verb":"look","tier":"telepathy"}"#)
+        == .failure(.invalidField(field: "tier", value: "telepathy")))
+
+    // "none" is the rung that takes no picture, so forcing it is not a request.
+    #expect(HarnessPolicy.decode(line: #"{"verb":"look","tier":"none"}"#)
+        == .failure(.invalidField(field: "tier", value: "none")))
+
+    guard case .success(let chosen) = HarnessPolicy.decode(line: #"{"verb":"look","tier":"display"}"#) else {
+        Issue.record("a known tier must decode")
+        return
+    }
+    #expect(chosen.tier == .display)
+
+    // `look` takes no title — it is the verb for when the name did not work.
+    guard case .success(let bare) = HarnessPolicy.decode(line: #"{"verb":"look"}"#) else {
+        Issue.record("look must decode without a title")
+        return
+    }
+    #expect(bare.tier == nil)
+    #expect(bare.escalate == false)
+    #expect(bare.verb.isMutating == false)
+    #expect(bare.verb.elementAction == nil)
+
+    guard case .success(let escalating) = HarnessPolicy.decode(
+        line: #"{"verb":"press","title":"Save","escalate":true}"#
+    ) else {
+        Issue.record("escalate must decode on an acting verb")
+        return
+    }
+    #expect(escalating.escalate)
+}

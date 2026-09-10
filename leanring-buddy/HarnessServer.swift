@@ -51,6 +51,12 @@ struct HarnessRawRequest: Decodable {
     /// `"focused"`, or absent for the ordinary name-resolved path.
     let target: String?
     let thenConfirm: Bool?
+
+    /// look only: force a rung of the escalation ladder instead of choosing one.
+    let tier: String?
+    /// press / select / open / type: on a `notFound` or `ambiguous`, come back
+    /// with the picture rather than only the offer of one.
+    let escalate: Bool?
 }
 
 struct HarnessPoint: Decodable {
@@ -81,12 +87,17 @@ enum HarnessVerb: String, CaseIterable {
     /// whatever the human left in front; this is how a caller moves that anchor.
     case focus
 
+    /// The smallest picture that would let a caller decide, plus the structural
+    /// candidates inside it. Read-only — it takes a photograph and changes
+    /// nothing — so it survives the kill switch, exactly like `snapshot`.
+    case look
+
     /// Whether this verb can change the world. The kill switch stops these and
     /// leaves the read-only pair working, so an operator who tripped it can
     /// still look at the machine and find out why.
     var isMutating: Bool {
         switch self {
-        case .ping, .snapshot, .menus, .windows: return false
+        case .ping, .snapshot, .menus, .windows, .look: return false
         case .press, .select, .type, .open, .menu, .focus: return true
         }
     }
@@ -105,7 +116,10 @@ enum HarnessVerb: String, CaseIterable {
         // `focus` acts too, and is nil here for the same reason: its target is a
         // window, not a named element inside one, so it never enters the
         // name-resolving path and its kernel check is `evaluateFocus`.
-        case .ping, .snapshot, .menu, .menus, .windows, .focus: return nil
+        //
+        // `look` is nil for a third reason: it does not act at all. It resolves
+        // a name only to find out how many things carry it.
+        case .ping, .snapshot, .menu, .menus, .windows, .focus, .look: return nil
         }
     }
 }
@@ -172,6 +186,11 @@ struct HarnessRequest: Equatable {
 
     /// windows / focus only. nil means the frontmost application.
     var app: String? = nil
+
+    /// look only. nil means "choose the rung".
+    var tier: EscalationLadder.Tier? = nil
+    /// Acting verbs only: whether a failed resolution should pay for a capture.
+    var escalate: Bool = false
 }
 
 // MARK: - Pure decision logic
@@ -231,6 +250,19 @@ enum HarnessPolicy {
             return .failure(.missingField("app"))
         }
 
+        // A forced rung, validated the same way `mode` and `target` are: a
+        // typo'd tier would otherwise be silently ignored and the caller would
+        // get a rung it did not ask for, which is the whole failure mode this
+        // interface refuses to have. `"none"` is rejected too — it is the rung
+        // that takes no picture, so forcing it is not a request.
+        var tier: EscalationLadder.Tier?
+        if let requestedTier = raw.tier {
+            guard let parsed = EscalationLadder.Tier(rawValue: requestedTier), parsed != .none else {
+                return .failure(.invalidField(field: "tier", value: requestedTier))
+            }
+            tier = parsed
+        }
+
         var mode = TypeMode.insert
         if verb == .type {
             guard !(raw.text ?? "").isEmpty else {
@@ -263,7 +295,9 @@ enum HarnessPolicy {
             aimAtFocus: aimAtFocus,
             thenConfirm: raw.thenConfirm ?? false,
             path: path,
-            app: (raw.app?.isEmpty == false) ? raw.app : nil
+            app: (raw.app?.isEmpty == false) ? raw.app : nil,
+            tier: tier,
+            escalate: raw.escalate ?? false
         ))
     }
 
@@ -906,6 +940,9 @@ final class HarnessServer {
 
         case .focus:
             return focusResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .look:
+            return lookResponse(request, dryRun: dryRun, startedAt: startedAt)
         }
     }
 
@@ -1022,12 +1059,17 @@ final class HarnessServer {
                 response["resolution"] = ["status": "notFound", "matchCount": 0]
                 response["ok"] = false
                 response["error"] = "notFound"
+                // The two answers a tree walk cannot improve on its own are the
+                // two that get a rung offered. Everything else here is a
+                // decision the harness already made.
+                attachEscalation(to: &response, request: request, rootNode: rootNode)
                 audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
                 return response
             case .ambiguous(let matchCount):
                 response["resolution"] = ["status": "ambiguous", "matchCount": matchCount]
                 response["ok"] = false
                 response["error"] = "ambiguous"
+                attachEscalation(to: &response, request: request, rootNode: rootNode)
                 audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ambiguous", startedAt: startedAt)
                 return response
             }
@@ -1766,6 +1808,7 @@ final class HarnessServer {
                 ]
                 response["ok"] = false
                 response["error"] = "notFound"
+                attachFocusEscalation(to: &response, request: request, windows: read.windows.map(\.candidate))
                 audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
                 return response
             case .ambiguous(let count):
@@ -1790,6 +1833,12 @@ final class HarnessServer {
         guard executability.executable else {
             response["ok"] = false
             response["error"] = described.decision == "refuse" ? "kernelRefused" : "confirmationRequired"
+            // An ambiguous window title is precisely what a picture settles, so
+            // this verb gets the ladder too — built from the window list, which
+            // is the candidate set it resolves against.
+            if matchCount != 1 {
+                attachFocusEscalation(to: &response, request: request, windows: read.windows.map(\.candidate))
+            }
             audit(request, dryRun: dryRun, kernel: described.decision,
                   outcome: described.decision == "refuse" ? "kernelRefused" : "confirmationRequired",
                   startedAt: startedAt)
@@ -1830,6 +1879,385 @@ final class HarnessServer {
         if !outcome.observed { response["error"] = "notVerified" }
         audit(request, dryRun: dryRun, kernel: described.decision,
               outcome: outcome.observed ? "confirmed" : "notObserved", startedAt: startedAt)
+        return response
+    }
+
+    // MARK: look / escalation
+
+    // Capture timing is reported as `captureMilliseconds` and NEVER as
+    // `walkMilliseconds` — for exactly the reason spelled out in full above
+    // `// MARK: menu / menus`. A capture is a fourth population (fixed ~344 ms,
+    // measured 2026-09-08) and `observe` keys its per-app slow-walk median on
+    // `walkMilliseconds` alone. A `look` still reports the *tree walk* it did as
+    // `walkMilliseconds`, because that one really is a window walk of the same
+    // window every other verb measures.
+
+    /// Which rung, over what rectangle, showing what.
+    private struct EscalationPlan {
+        let tier: EscalationLadder.Tier
+        let reason: String
+        let region: CGRect
+        /// Which resolver these candidates — and therefore these suggested
+        /// points — belong to.
+        ///
+        /// Measured 2026-09-10, and it is a trap that returned a plausible
+        /// wrong answer: `press` resolves names in the focused window's tree,
+        /// where "Recent" matched one AXWindow and two sidebar AXStaticTexts,
+        /// so the separating point was computed against those three. `focus`
+        /// resolves the same word against the app's **window list**, where
+        /// "Recent" matched two windows — and that point sits inside both.
+        /// Re-issuing it came straight back ambiguous. A separating point is
+        /// only valid within the candidate set it was computed from, so the
+        /// set has to travel with it.
+        let resolver: String
+        /// What a caller would have to choose between.
+        let candidates: [AccessibilityElementNode]
+        /// Everything the tree knows is inside the rectangle — the kernel's
+        /// input, and a superset of `candidates` because a secure field is
+        /// almost never the thing that was named.
+        let elementsInRegion: [AccessibilityElementNode]
+    }
+
+    /// The rectangle a display tier would cover: the display holding the
+    /// window, else the one holding the cursor, else the first one.
+    private static func fallbackDisplayFrame(
+        forWindowFrame windowFrame: CGRect?,
+        among displays: [EscalationLadder.DisplayInfo]
+    ) -> CGRect? {
+        if let windowFrame, windowFrame.width > 0, windowFrame.height > 0,
+           let display = EscalationLadder.display(holding: windowFrame, among: displays) {
+            return display.appKitFrame
+        }
+        let cursor = NSEvent.mouseLocation
+        return displays.first(where: { $0.appKitFrame.contains(cursor) })?.appKitFrame
+            ?? displays.first?.appKitFrame
+    }
+
+    private func escalationPlan(
+        forcedTier: EscalationLadder.Tier?,
+        title: String,
+        role: String?,
+        rootNode: AccessibilityElementNode?
+    ) -> EscalationPlan? {
+        let displays = EscalationLadder.displays()
+        let allNodes = rootNode?.flattenedDescendants() ?? []
+        let candidates = (rootNode.map { root in
+            title.isEmpty ? [] : EscalationLadder.namedCandidates(in: root, title: title, role: role)
+        }) ?? []
+
+        let choice = EscalationLadder.chooseTier(
+            forcedTier: forcedTier,
+            candidateFrames: candidates.map(\.frameInAppKitCoordinates),
+            windowFrame: rootNode?.frameInAppKitCoordinates,
+            windowActionableCount: allNodes.filter(\.isActionable).count
+        )
+
+        let region: CGRect?
+        switch choice.tier {
+        case .element:
+            region = EscalationLadder.region(forCandidateFrames: candidates.map(\.frameInAppKitCoordinates))
+        case .window:
+            region = rootNode?.frameInAppKitCoordinates
+        case .display, .none:
+            region = Self.fallbackDisplayFrame(
+                forWindowFrame: rootNode?.frameInAppKitCoordinates, among: displays
+            )
+        }
+        guard let region, region.width > 0, region.height > 0 else { return nil }
+
+        let inRegion = allNodes.filter { $0.frameInAppKitCoordinates.intersects(region) }
+        return EscalationPlan(
+            tier: choice.tier,
+            reason: choice.reason,
+            region: region,
+            resolver: "elementName",
+            // On the window and display rungs nothing was named, so the useful
+            // list is what a caller could name instead.
+            candidates: choice.tier == .element ? candidates : inRegion.filter(\.isActionable),
+            elementsInRegion: inRegion
+        )
+    }
+
+    /// How many candidates a payload will describe.
+    ///
+    /// The window and display rungs answer "what could you have named instead",
+    /// which on a rich app is everything actionable — measured 2026-09-10,
+    /// Claude Desktop's window returned **110**. That is a large response, and
+    /// the separating-point search is quadratic in it: each candidate cuts its
+    /// frame at every other candidate's edges, so 110 candidates build a
+    /// 221x221 arrangement each, 5.4 million points across the list. Forty is
+    /// past the point where a caller reads them anyway.
+    static let maximumCandidates = 40
+
+    /// Hang the ladder off a failed `focus`, free unless the caller asked to pay.
+    private func attachFocusEscalation(
+        to response: inout [String: Any],
+        request: HarnessRequest,
+        windows: [AccessibilityWindows.WindowCandidate]
+    ) {
+        guard let plan = windowEscalationPlan(title: request.title, windows: windows) else { return }
+        let result = escalationPayload(plan: plan, capture: request.escalate)
+        var payload = result.payload
+        payload["available"] = true
+        if !request.escalate {
+            payload["hint"] = "re-issue with \"escalate\": true for an image and candidate points"
+        }
+        response["escalation"] = payload
+    }
+
+    /// The same ladder, built from an app's **window list** instead of a window's
+    /// element tree — the candidate set `focus` actually resolves against.
+    ///
+    /// Windows are turned into `AccessibilityElementNode`s rather than given a
+    /// parallel summariser: they have a role, a name, a frame and a published
+    /// action list, which is everything the candidate machinery reads.
+    private func windowEscalationPlan(
+        title: String,
+        windows: [AccessibilityWindows.WindowCandidate]
+    ) -> EscalationPlan? {
+        func node(_ candidate: AccessibilityWindows.WindowCandidate) -> AccessibilityElementNode {
+            AccessibilityElementNode(
+                role: candidate.role, subrole: candidate.subrole,
+                title: candidate.title?.raw, value: nil,
+                frameInAppKitCoordinates: candidate.frameInAppKitCoordinates,
+                depth: 0, children: [],
+                publishedActionNames: candidate.publishedActionNames
+            )
+        }
+
+        let lowercased = title.lowercased()
+        let matching = windows.filter { $0.title?.raw.lowercased() == lowercased }
+        let shown = matching.isEmpty ? windows : matching
+        let candidates = shown.map(node)
+        guard let region = EscalationLadder.region(
+            forCandidateFrames: candidates.map(\.frameInAppKitCoordinates)
+        ) else { return nil }
+
+        return EscalationPlan(
+            tier: .element,
+            reason: matching.isEmpty
+                ? "no window matched that title; the region is the union of the app's \(windows.count) window(s)"
+                : "\(matching.count) window(s) matched that title; the region is the union of their frames padded",
+            region: region,
+            resolver: "windowTitle",
+            candidates: candidates,
+            // No tree was walked for another app's windows, so the kernel has
+            // nothing structural to inspect. Reported, never assumed safe.
+            elementsInRegion: []
+        )
+    }
+
+    /// The candidate list, each entry carrying a point that provably picks it
+    /// out — or saying that no point does.
+    ///
+    /// Plausibly-named candidates come first, because a name is the only thing
+    /// a caller can re-issue the intent with; an anonymous element in this list
+    /// is context, not an option.
+    private static func summariseCandidates(_ all: [AccessibilityElementNode]) -> [[String: Any]] {
+        let named = all.filter { $0.displayName?.isPlausibleControlLabel == true }
+        let anonymous = all.filter { $0.displayName?.isPlausibleControlLabel != true }
+        let nodes = Array((named + anonymous).prefix(maximumCandidates))
+        let frames = nodes.map(\.frameInAppKitCoordinates)
+        return nodes.indices.map { index in
+            var entry = summarise(nodes[index])
+            entry["index"] = index
+            let point = EscalationLadder.separatingPoint(forCandidateAt: index, among: frames)
+            entry["suggestedPoint"] = point.map { ["x": $0.x, "y": $0.y] } ?? NSNull()
+            // Never omitted, and never a "nearest" fallback: `false` is the
+            // answer that stops a caller re-issuing a point that will only come
+            // back ambiguous again.
+            entry["separable"] = point != nil
+            return entry
+        }
+    }
+
+    /// The whole payload, shared by `look` (where it is the response) and the
+    /// acting verbs (where it hangs under `escalation`).
+    private func escalationPayload(
+        plan: EscalationPlan,
+        capture: Bool
+    ) -> (payload: [String: Any], errorCode: String?) {
+        var payload: [String: Any] = [
+            "tier": plan.tier.rawValue,
+            "reason": plan.reason,
+            // A suggested point below is only re-issuable to the verb that
+            // resolves this way. See `EscalationPlan.resolver`.
+            "resolver": plan.resolver
+        ]
+
+        guard capture else {
+            // The free half, and it is free in bytes as well as in time: which
+            // rung and why, nothing else. A capture costs ~344 ms (measured
+            // 2026-09-08), so making every `notFound` pay for one silently
+            // would turn a 12 ms refusal into a 350 ms one for callers that
+            // never wanted a picture — and a candidate list here would put a
+            // whole window's actionable elements into every failed press.
+            payload["hint"] = "re-issue with \"escalate\": true for an image and candidate points"
+            return (payload, nil)
+        }
+
+        payload["region"] = [
+            "x": plan.region.origin.x, "y": plan.region.origin.y,
+            "w": plan.region.size.width, "h": plan.region.size.height
+        ]
+        // The true total, always — the list below may be shorter. A count that
+        // silently equalled the list length would be the truncation defect this
+        // project already paid for once, in a new place.
+        payload["candidateCount"] = plan.candidates.count
+        let listed = Self.summariseCandidates(plan.candidates)
+        payload["candidates"] = listed
+        if listed.count < plan.candidates.count {
+            payload["candidatesTruncated"] = true
+            payload["warning"] = "THIS LIST IS A FLOOR, NOT A MEASUREMENT — showing \(listed.count) "
+                + "of \(plan.candidates.count) candidates, named ones first"
+        }
+
+        // The kernel runs before the shutter, not after. A refusal that arrives
+        // once the JPEG is on disk is not a refusal.
+        // Say whether the check could actually look. An empty element list and
+        // a region with genuinely no secure field produce the same `.allow`,
+        // and this project has been bitten six times by exactly that shape.
+        payload["secureFieldCheck"] = plan.elementsInRegion.isEmpty ? "unavailable" : "structural"
+        let decision = ActionSafetyKernel.evaluateCapture(elementsInRegion: plan.elementsInRegion)
+        let described = HarnessPolicy.describe(decision)
+        let executability = HarnessPolicy.executability(of: decision, confirmed: false)
+        payload["kernel"] = [
+            "decision": described.decision,
+            "reason": (described.reason ?? NSNull()) as Any,
+            "executable": executability.executable,
+            "note": (executability.reason ?? NSNull()) as Any
+        ]
+        guard executability.executable else {
+            return (payload, "kernelRefused")
+        }
+
+        let displays = EscalationLadder.displays()
+        guard let display = EscalationLadder.display(holding: plan.region, among: displays) else {
+            payload["message"] = EscalationLadder.CaptureFailure.regionOffScreen.description
+            return (payload, "captureFailed")
+        }
+
+        switch EscalationLadder.captureSynchronously(
+            region: plan.region, on: display,
+            excludingBundleIdentifier: Bundle.main.bundleIdentifier
+        ) {
+        case .failure(let error):
+            payload["message"] = String(describing: error)
+            return (payload, "captureFailed")
+
+        case .success(let outcome):
+            guard let url = EscalationLadder.writeImage(outcome.jpeg) else {
+                payload["message"] = "the image could not be written to \(EscalationLadder.imageDirectory.path)"
+                return (payload, "captureFailed")
+            }
+            payload["imagePath"] = url.path
+            payload["imageBytes"] = outcome.jpeg.count
+            payload["imagePixels"] = ["w": outcome.pixelWidth, "h": outcome.pixelHeight]
+            // What was actually photographed, which is the request clipped to
+            // the display — not the request.
+            payload["region"] = [
+                "x": outcome.region.origin.x, "y": outcome.region.origin.y,
+                "w": outcome.region.size.width, "h": outcome.region.size.height
+            ]
+            // The case for a crop is sharpness, not cost, so the resolution is
+            // in the response rather than left to be inferred from two numbers.
+            // Points per pixel: 0.5 is a Retina display captured at full scale,
+            // 1.0 is one pixel per point, and anything above 1 means the 4096
+            // cap shrank it.
+            payload["pointsPerPixel"] = outcome.pixelWidth > 0
+                ? outcome.region.width / CGFloat(outcome.pixelWidth) : 0
+            // One estimator in this project, and it is the one that reproduces
+            // Anthropic's published table.
+            payload["estimatedVisualTokens"] = AccessibilityDumpRunner.estimatedVisualTokens(
+                width: outcome.pixelWidth, height: outcome.pixelHeight, usesHighResolutionTier: false
+            )
+            payload["captureMilliseconds"] = outcome.milliseconds
+            return (payload, nil)
+        }
+    }
+
+    /// Hangs an escalation block under a failed acting verb.
+    ///
+    /// Always the announcement — which rung would be chosen and why — because
+    /// the tree is already in hand and that costs nothing. The picture only
+    /// when the caller asked for it.
+    private func attachEscalation(
+        to response: inout [String: Any],
+        request: HarnessRequest,
+        rootNode: AccessibilityElementNode
+    ) {
+        guard let plan = escalationPlan(
+            forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode
+        ) else { return }
+
+        let result = escalationPayload(plan: plan, capture: request.escalate)
+        var block = result.payload
+        block["available"] = true
+        // The top-level error stays `notFound`/`ambiguous` — that is what the
+        // caller asked for and did not get. A capture that then also failed is
+        // a second, separate fact and says so where it happened.
+        if let code = result.errorCode { block["error"] = code }
+        response["escalation"] = block
+    }
+
+    private func lookResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        var response: [String: Any] = [
+            "title": request.title.isEmpty ? NSNull() : request.title,
+            "requestedTier": (request.tier?.rawValue ?? NSNull()) as Any
+        ]
+
+        func fail(_ code: String, _ message: String) -> [String: Any] {
+            response["ok"] = false
+            response["error"] = code
+            response["message"] = message
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: code, startedAt: startedAt)
+            return response
+        }
+
+        // Same guard the walker, the menu path and the window path have. A
+        // locked screen is the one thing this verb must never photograph — and
+        // it is the failure this project recorded as data three times before
+        // anyone read the app name.
+        guard !LockScreenGuard.isLockScreen(Self.frontmostBundleIdentifier()) else {
+            return fail("screenIsLocked", "the screen is locked — there is nothing of the user's to photograph")
+        }
+
+        // A failed walk is not fatal here: the display rung needs no tree at
+        // all, and "I could not read the window, here is the screen" is a more
+        // useful answer than a refusal. Why it failed still travels.
+        var rootNode: AccessibilityElementNode?
+        do {
+            let snapshot = try AccessibilityTreeWalker.snapshotFocusedWindow()
+            rootNode = snapshot.rootNode
+            response["application"] = snapshot.applicationName
+            response["bundleIdentifier"] = snapshot.bundleIdentifier
+            response["walkMilliseconds"] = Int(snapshot.walkDurationInSeconds * 1000)
+        } catch {
+            response["snapshotError"] = Self.errorCode(for: error)
+            response["application"] = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+            response["bundleIdentifier"] = Self.frontmostBundleIdentifier() ?? "unknown"
+        }
+
+        guard let plan = escalationPlan(
+            forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode
+        ) else {
+            return fail(
+                "notFound",
+                request.tier == .element
+                    ? "nothing matched that name, so there is no element region to crop to"
+                    : "no rectangle to capture: neither a window frame nor a display frame was readable"
+            )
+        }
+
+        let result = escalationPayload(plan: plan, capture: true)
+        for (key, value) in result.payload { response[key] = value }
+        response["ok"] = result.errorCode == nil
+        if let code = result.errorCode { response["error"] = code }
+        audit(
+            request, dryRun: dryRun,
+            kernel: (result.payload["kernel"] as? [String: Any])?["decision"] as? String ?? "n/a",
+            outcome: result.errorCode ?? "ok", startedAt: startedAt
+        )
         return response
     }
 

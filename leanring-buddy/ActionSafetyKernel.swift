@@ -107,6 +107,7 @@ enum ActionSafetyKernel {
     static func isSecurityRefusal(reason: String) -> Bool {
         reason == implausibleNameRefusalReason
             || reason.hasPrefix("refusing to type into a secure field")
+            || reason.hasPrefix(secureFieldCaptureRefusalPrefix)
             || reason.hasPrefix(irreversibleRefusalPrefix)
     }
 
@@ -222,6 +223,29 @@ enum ActionSafetyKernel {
         }
         if let windowTitle, !windowTitle.isPlausibleControlLabel {
             return .refuse(reason: implausibleNameRefusalReason)
+        }
+        return .allow
+    }
+
+    static let secureFieldCaptureRefusalPrefix = "refusing to capture a region containing a secure field"
+
+    /// Whether a region may be photographed.
+    ///
+    /// One rule: **this agent does not photograph password fields.** A crop
+    /// taken to disambiguate a button is still a picture of everything else in
+    /// the rectangle, and a screenshot of a field mid-entry is a credential
+    /// leak that no later refusal undoes — the file is already on disk.
+    ///
+    /// Like the typing refusal, `confirmed: true` cannot lift this. That is
+    /// automatic rather than argued: `HarnessPolicy.executability` has no
+    /// confirmed branch for `.refuse` at all. It is stated here because a
+    /// reader of this function should not have to go and check.
+    ///
+    /// Note what is NOT checked: the field's value. The kernel decides on the
+    /// subrole alone and never reads the text it is protecting.
+    static func evaluateCapture(elementsInRegion: [AccessibilityElementNode]) -> SafetyDecision {
+        if elementsInRegion.contains(where: { $0.subrole == secureFieldSubrole }) {
+            return .refuse(reason: "\(secureFieldCaptureRefusalPrefix) (subrole \(secureFieldSubrole))")
         }
         return .allow
     }
