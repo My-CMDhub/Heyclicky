@@ -783,3 +783,134 @@ private func windowContaining(_ children: [AccessibilityElementNode]) -> Accessi
     #expect(LockScreenGuard.isLockScreen("com.apple.finder") == false)
     #expect(LockScreenGuard.isLockScreen(nil) == false)
 }
+
+// MARK: - Harness: the pure half
+//
+// Only the decisions are tested here. The socket, the walk and the write are
+// cross-process and a mock of them would test the mock — those are proven by
+// the live transcript instead.
+
+@Test func aWellFormedRequestDecodesIntoATypedCommand() async throws {
+    let line = #"{"id":"r1","verb":"select","title":"Sound","withinNamed":"Sidebar","nearPoint":{"x":40,"y":300},"dryRun":true}"#
+    guard case .success(let request) = HarnessPolicy.decode(line: line) else {
+        Issue.record("expected a decoded request")
+        return
+    }
+
+    #expect(request.id == "r1")
+    #expect(request.verb == .select)
+    #expect(request.title == "Sound")
+    #expect(request.withinNamed == "Sidebar")
+    #expect(request.nearPoint == CGPoint(x: 40, y: 300))
+    #expect(request.requestedDryRun == true)
+    #expect(request.confirmed == false)   // absent means not confirmed, never assumed
+}
+
+@Test func anUnknownVerbIsRefusedRatherThanGuessedAt() async throws {
+    // "pres" is one keystroke from "press". A helpful correction here is a
+    // click nobody asked for.
+    guard case .failure(let error) = HarnessPolicy.decode(line: #"{"id":"r2","verb":"pres","title":"About"}"#) else {
+        Issue.record("expected a refusal")
+        return
+    }
+    #expect(error == .unknownVerb("pres"))
+    #expect(error.code == "unknownVerb")
+}
+
+@Test func malformedJSONIsAStructuredErrorNotACrash() async throws {
+    guard case .failure(let error) = HarnessPolicy.decode(line: "{not json at all") else {
+        Issue.record("expected a refusal")
+        return
+    }
+    #expect(error.code == "malformedJSON")
+
+    // A verb that acts needs something to aim at, and an empty title would
+    // otherwise match every anonymous element in the tree.
+    guard case .failure(let missing) = HarnessPolicy.decode(line: #"{"id":"r3","verb":"press"}"#) else {
+        Issue.record("expected a missing-field refusal")
+        return
+    }
+    #expect(missing == .missingField("title"))
+}
+
+@Test func theKillSwitchStopsWritingAndLeavesReadingAlone() async throws {
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .press, killSwitchPresent: true) != nil)
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .select, killSwitchPresent: true) != nil)
+
+    // Read-only stays up on purpose: an operator who tripped the switch needs
+    // to be able to see what the machine is looking at.
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .ping, killSwitchPresent: true) == nil)
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .snapshot, killSwitchPresent: true) == nil)
+
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .press, killSwitchPresent: false) == nil)
+}
+
+@Test func aRequestMayTurnDryRunOnAndMayNotTurnItOff() async throws {
+    #expect(HarnessPolicy.effectiveDryRun(requested: nil, globalDefault: false) == false)
+    #expect(HarnessPolicy.effectiveDryRun(requested: true, globalDefault: false) == true)
+
+    // The operator's launch flag is a switch, not a default. If a caller could
+    // clear it, the caller — the party this interface exists to constrain —
+    // would be deciding whether it is constrained.
+    #expect(HarnessPolicy.effectiveDryRun(requested: false, globalDefault: true) == true)
+    #expect(HarnessPolicy.effectiveDryRun(requested: nil, globalDefault: true) == true)
+}
+
+@Test func requireConfirmationIsNotExecutableOverASocketWithoutAnExplicitYes() async throws {
+    let question = SafetyDecision.requireConfirmation(reason: "title suggests a destructive action: delete")
+
+    let unconfirmed = HarnessPolicy.executability(of: question, confirmed: false)
+    #expect(unconfirmed.executable == false)
+    #expect(unconfirmed.reason?.contains("confirmed") == true)
+
+    // Re-issuing with confirmed:true does not change the kernel's answer, it
+    // records who took responsibility for it. The audit line carries the flag.
+    #expect(HarnessPolicy.executability(of: question, confirmed: true).executable)
+
+    // A refusal is a refusal. Confirmation cannot buy past it.
+    let refusal = SafetyDecision.refuse(reason: ActionSafetyKernel.zeroAreaRefusalReason)
+    #expect(HarnessPolicy.executability(of: refusal, confirmed: true).executable == false)
+    #expect(HarnessPolicy.executability(of: refusal, confirmed: false).executable == false)
+
+    #expect(HarnessPolicy.executability(of: .allow, confirmed: false).executable)
+}
+
+@Test func anAuditLineIsOneJSONRecordThatATitleCannotForgeASecondOf() async throws {
+    let line = HarnessPolicy.auditLine(
+        at: Date(timeIntervalSince1970: 0),
+        id: "r9",
+        verb: "select",
+        // App-facing text a caller supplied. A raw newline here would otherwise
+        // write a second, fictitious record into an append-only log.
+        target: "Sound\nrefused",
+        dryRun: false,
+        confirmed: true,
+        kernel: "requireConfirmation",
+        outcome: "confirmationRequired",
+        milliseconds: 42
+    )
+
+    #expect(line.contains("\n") == false)
+
+    let parsed = try #require(
+        try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+    )
+    #expect(parsed["id"] as? String == "r9")
+    #expect(parsed["verb"] as? String == "select")
+    #expect(parsed["target"] as? String == "Sound\nrefused")
+    #expect(parsed["dryRun"] as? Bool == false)
+    #expect(parsed["confirmed"] as? Bool == true)
+    #expect(parsed["kernel"] as? String == "requireConfirmation")
+    #expect(parsed["outcome"] as? String == "confirmationRequired")
+    #expect(parsed["ms"] as? Int == 42)
+    #expect((parsed["timestamp"] as? String)?.hasPrefix("1970-01-01T") == true)
+
+    // A refused request leaves nothing else behind, so it is logged the same
+    // shape as one that ran.
+    let refused = HarnessPolicy.auditLine(
+        at: Date(timeIntervalSince1970: 0), id: "", verb: "?", target: nil,
+        dryRun: false, confirmed: false, kernel: "n/a",
+        outcome: "unknownVerb", milliseconds: 0
+    )
+    #expect(refused.contains("\"outcome\":\"unknownVerb\""))
+}

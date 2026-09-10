@@ -33,6 +33,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarPanelManager: MenuBarPanelManager?
     private let companionManager = CompanionManager()
     private var sparkleUpdaterController: SPUStandardUpdaterController?
+    private var harnessServer: HarnessServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if CommandLine.arguments.contains("--capture-smoke-test") {
@@ -68,6 +69,17 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--ax-task") {
             Task { await AccessibilityDumpRunner.runTask() }
             return
+        }
+
+        // Unlike every other --ax-* entry point, this one does NOT terminate:
+        // the harness is a server, so the app carries on being a menu-bar app
+        // with a socket open beside it.
+        if CommandLine.arguments.contains("--harness") {
+            let server = HarnessServer(
+                globalDryRun: CommandLine.arguments.contains("--harness-dry-run")
+            )
+            server.start()
+            harnessServer = server
         }
 
         print("🎯 Clicky: Starting...")
