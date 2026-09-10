@@ -107,6 +107,7 @@ enum ActionSafetyKernel {
     static func isSecurityRefusal(reason: String) -> Bool {
         reason == implausibleNameRefusalReason
             || reason.hasPrefix("refusing to type into a secure field")
+            || reason.hasPrefix(irreversibleRefusalPrefix)
     }
 
     static func nonTextRoleRefusalReason(role: String) -> String {
@@ -121,7 +122,6 @@ enum ActionSafetyKernel {
         "replace would discard \(characterCount) characters already in the field"
     }
 
-    /// Words that make an action worth asking about regardless of role.
     /// Refusal reasons as constants, so the probe can classify a decision by
     /// identity rather than by re-typing the sentence and silently missing.
     static let zeroAreaRefusalReason = "listed but not reachable: element has a zero-area frame"
@@ -141,20 +141,90 @@ enum ActionSafetyKernel {
         "menu item \(name) is disabled (AXEnabled false) — pressing it would return success and do nothing"
     }
 
+    /// The second refusal with no confirmed path past it, and the only one that
+    /// is about the *world* rather than about us.
+    ///
+    /// Everything else destructive escalates to a question, because a question
+    /// has an answer: a human looks at it and decides. These do not, because by
+    /// the time anyone could look the thing is already gone. Emptying the bin
+    /// has no undo, an erase has no undo, and money that has left an account is
+    /// not a state this agent can restore. So the human does not *approve* these
+    /// — the human does them, in the app, with their own hands.
+    ///
+    /// Owner's ruling 2026-09-10, asked for in exactly those terms. It is a real
+    /// capability given up: the agent cannot empty a bin even when asked twice.
+    /// That is the point — `confirmed: true` records that someone took
+    /// responsibility, and no one can take responsibility for a thing they
+    /// cannot inspect first.
+    ///
+    /// Disjoint from `destructiveTitleKeywords` by construction (there is a test),
+    /// because a word in both lists would read as "asks a human" while behaving
+    /// as "refuses", and the weaker line is the one someone would believe.
+    static let irreversibleTitleKeywords = [
+        // Emptying the bin. No undo, in any locale spelling.
+        "empty trash", "empty bin",
+        // Finder's Option-Command-Delete, and the word every app reaches for
+        // when it means "not to the bin".
+        "delete immediately", "permanently",
+        // "Erase All Content and Settings", "Erase Disk", "Erase Free Space".
+        // Yes, this also refuses a drawing app's "Eraser" — a false positive
+        // here costs one manual click and an argument about it costs a disk.
+        "erase",
+        // Money. Distinct from the rest only in that the loss is someone
+        // else's problem to reverse, and usually cannot be.
+        "buy", "pay", "purchase"
+    ]
+
+    static let irreversibleRefusalPrefix = "refusing an irreversible action"
+
+    static func irreversibleRefusalReason(keyword: String) -> String {
+        "\(irreversibleRefusalPrefix): the title contains \"\(keyword)\" — this has no undo, "
+            + "so it has no confirmed path past it either; a human does this one themselves"
+    }
+
+    /// Words that make an action worth *asking* about regardless of role — all
+    /// of them reversible, or at least inspectable before the fact.
     static let destructiveTitleKeywords = [
-        "delete", "remove", "erase", "send", "buy", "pay", "purchase", "reset",
+        "delete", "remove", "send", "reset",
         // Menu-bar words. This check has always mattered; on a menu bar it
-        // matters most, because "Empty Trash" and "Quit" are two items away
-        // from anything and have no undo. "Move to Bin" / "Empty Bin" are
-        // spelled out rather than adding "bin", which is a substring of
-        // "Combine All Windows".
+        // matters most, because "Move to Bin" and "Quit" are two items away
+        // from anything. "Move to Bin" is spelled out rather than adding
+        // "bin", which is a substring of "Combine All Windows".
         //
         // Deliberately NOT here: "close". Closing a window is the ordinary
         // inverse of opening one — it is what makes a menu test reversible —
         // and adding it would put a question in front of every window close.
         "trash", "quit", "empty", "eject", "log out", "shut down",
-        "move to bin", "empty bin"
+        "move to bin"
     ]
+
+    /// Focus: the only verb here that is not evaluated by `evaluate`.
+    ///
+    /// It has no `ElementActionIntent`, no published action to require and no
+    /// role to recognise — the target is a window, not a control — so running
+    /// it through the main path would mean inventing an intent to satisfy
+    /// checks that do not apply to it. Two rules do apply, and they are the two
+    /// that are about *us* rather than about the action:
+    ///
+    ///   - more than one window matching is a question, never a coin flip, for
+    ///     the same reason it is everywhere else in this kernel;
+    ///   - a title is app-written text, and a name that is not a plain label is
+    ///     content that arrived in a name-shaped field.
+    ///
+    /// Nothing else. Focus destroys nothing, and its inverse is one click on
+    /// the app the caller was told it came from — a kernel that asked a human
+    /// to confirm bringing a window forward would make the harness unusable,
+    /// and an operator who has to answer a pointless question ten times a
+    /// minute stops reading the question.
+    static func evaluateFocus(windowTitle: UntrustedText?, matchCount: Int) -> SafetyDecision {
+        guard matchCount == 1 else {
+            return .refuse(reason: "\(matchCount) windows match that title")
+        }
+        if let windowTitle, !windowTitle.isPlausibleControlLabel {
+            return .refuse(reason: implausibleNameRefusalReason)
+        }
+        return .allow
+    }
 
     static func evaluate(
         intent: ElementActionIntent,
@@ -169,10 +239,33 @@ enum ActionSafetyKernel {
         // Before everything, including whether the element is even reachable:
         // a password field is refused on sight. There is no state of the world
         // and no `confirmed: true` that makes this an allow, so it is not a
-        // question — it is the one rule this kernel may not be argued out of.
+        // question. It is one of exactly two rules this kernel may not be
+        // argued out of — see `irreversibleTitleKeywords` for the other.
         if case .type = intent.action,
            let subrole = resolvedNode.subrole, subrole == secureFieldSubrole {
             return .refuse(reason: secureFieldRefusalReason(subrole: subrole))
+        }
+
+        // The other rule with no confirmed path past it, and it is checked here
+        // — above reachability, above the menu-enabled check — because those
+        // are all reasons an action *cannot* run right now, and this is a reason
+        // it may never run at all.
+        //
+        // The ordering is not cosmetic. Measured 2026-09-10: Finder's
+        // "Empty Bin…" is `AXEnabled false` while the bin is empty, so the
+        // disabled check answered first and the caller was told the item was
+        // disabled. That is an invitation to try again in a minute. A refusal
+        // that has no path must not read like a temporary one.
+        //
+        // The same title may also match both keyword lists ("Empty Trash"
+        // contains "trash"), so the stronger answer has to be the one reached.
+        if intent.action.irreversibleNamesAreRefused,
+           typing?.aimedByFocus != true,
+           let name = resolvedNode.displayName {
+            let lowercased = name.raw.lowercased()
+            if let matchedKeyword = irreversibleTitleKeywords.first(where: { lowercased.contains($0) }) {
+                return .refuse(reason: irreversibleRefusalReason(keyword: matchedKeyword))
+            }
         }
 
         guard matchCount == 1 else {
@@ -271,6 +364,7 @@ enum ActionSafetyKernel {
             // A keyword here escalates to a question; nothing an app publishes can
             // turn a question into an allow.
             let lowercasedTitle = name.raw.lowercased()
+
             if let matchedKeyword = destructiveTitleKeywords.first(where: { lowercasedTitle.contains($0) }) {
                 return .requireConfirmation(reason: "title suggests a destructive action: \(matchedKeyword)")
             }

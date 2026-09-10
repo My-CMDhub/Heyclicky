@@ -1383,7 +1383,7 @@ private func fileMenuBarFixture() -> AccessibilityMenu.Node {
 }
 
 @Test func theMenuBarsOwnDestructiveWordsStillStopAtAQuestion() async throws {
-    for label in ["Empty Trash", "Quit Finder", "Move to Bin", "Eject"] {
+    for label in ["Quit Finder", "Move to Bin", "Eject", "Delete Message"] {
         let item = AccessibilityElementNode(
             role: "AXMenuItem", subrole: nil, title: label, value: nil,
             frameInAppKitCoordinates: .zero, depth: 0, children: [],
@@ -1399,6 +1399,95 @@ private func fileMenuBarFixture() -> AccessibilityMenu.Node {
             continue
         }
         #expect(reason.hasPrefix("title suggests a destructive action:"))
+    }
+}
+
+// MARK: - The refusals with no confirmed path past them
+
+private func menuItemNode(_ label: String) -> AccessibilityElementNode {
+    AccessibilityElementNode(
+        role: "AXMenuItem", subrole: nil, title: label, value: nil,
+        frameInAppKitCoordinates: .zero, depth: 0, children: [],
+        publishedActionNames: ["AXPress"]
+    )
+}
+
+@Test func anIrreversibleTitleIsRefusedAndConfirmedCannotLiftIt() async throws {
+    for label in [
+        "Empty Trash", "Empty Bin", "Delete Immediately",
+        "Erase All Content and Settings", "Delete Permanently", "Buy Now"
+    ] {
+        let decision = ActionSafetyKernel.evaluate(
+            intent: ElementActionIntent(role: nil, title: label, action: .menu),
+            resolvedNode: menuItemNode(label), matchCount: 1,
+            visibleBounds: .infinite, menuItemEnabled: true
+        )
+        guard case .refuse(let reason) = decision else {
+            Issue.record("\(label) should have been refused outright, got \(decision)")
+            continue
+        }
+        #expect(reason.hasPrefix(ActionSafetyKernel.irreversibleRefusalPrefix))
+
+        // The whole point of the list: the socket's escape hatch does not open
+        // this door. `confirmed` only ever answers a requireConfirmation.
+        let (executable, _) = HarnessPolicy.executability(of: decision, confirmed: true)
+        #expect(executable == false)
+
+        // And it is the shape of an attempt, so the recorder keeps the context.
+        #expect(ActionSafetyKernel.isSecurityRefusal(reason: reason))
+    }
+}
+
+@Test func selectingARowNamedPurchasedIsNavigationAndIsNotRefused() async throws {
+    // Music and the App Store both label a sidebar row "Purchased". Selecting
+    // it opens a list; pressing a button by that name is a different question.
+    let row = AccessibilityElementNode(
+        role: "AXRow", subrole: nil, title: "Purchased", value: nil,
+        frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 200, height: 24),
+        depth: 0, children: [], publishedActionNames: []
+    )
+    let selecting = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Purchased", action: .select),
+        resolvedNode: row, matchCount: 1, visibleBounds: .infinite
+    )
+    #expect(selecting == .allow)
+
+    let button = AccessibilityElementNode(
+        role: "AXButton", subrole: nil, title: "Purchased", value: nil,
+        frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 200, height: 24),
+        depth: 0, children: [], publishedActionNames: ["AXPress"]
+    )
+    let pressing = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Purchased", action: .press),
+        resolvedNode: button, matchCount: 1, visibleBounds: .infinite
+    )
+    guard case .refuse(let reason) = pressing else {
+        Issue.record("pressing should still refuse, got \(pressing)")
+        return
+    }
+    #expect(reason.hasPrefix(ActionSafetyKernel.irreversibleRefusalPrefix))
+}
+
+@Test func theTwoKeywordListsAreDisjointSoTheStrongerAnswerIsTheOneReached() async throws {
+    // "Empty Trash" contains both "empty trash" and "trash". If a word sat in
+    // both lists, reading either one alone would tell you the wrong thing about
+    // what the kernel does — and the reassuring list is the one people read.
+    for irreversible in ActionSafetyKernel.irreversibleTitleKeywords {
+        #expect(
+            !ActionSafetyKernel.destructiveTitleKeywords.contains(irreversible),
+            "\(irreversible) is in both lists"
+        )
+    }
+    // Overlap by containment is fine and expected ("trash" ⊂ "empty trash") —
+    // this asserts the order that makes it safe, not that it does not happen.
+    let emptyTrash = ActionSafetyKernel.evaluate(
+        intent: ElementActionIntent(role: nil, title: "Empty Trash", action: .menu),
+        resolvedNode: menuItemNode("Empty Trash"), matchCount: 1,
+        visibleBounds: .infinite, menuItemEnabled: true
+    )
+    #expect(ActionSafetyKernel.destructiveTitleKeywords.contains("trash"))
+    if case .requireConfirmation = emptyTrash {
+        Issue.record("the escalation list reached Empty Trash before the refusal did")
     }
 }
 
@@ -1519,4 +1608,154 @@ private func fileMenuBarFixture() -> AccessibilityMenu.Node {
             return
         }
     }
+}
+
+// MARK: - windows / focus
+//
+// Pure logic only. Whether `AXRaise` actually raises a Finder window is a fact
+// about Finder, and mocking `AXUIElementPerformAction` would prove only that the
+// mock was written to agree — that half is proven by running it over the socket.
+
+@Test func aFocusRequestNeedsSomethingToAimAtAndTheAppFieldDecodes() async throws {
+    // Neither half present is a request to focus nothing.
+    switch HarnessPolicy.decode(line: #"{"id":"1","verb":"focus"}"#) {
+    case .failure(let error):
+        #expect(error == .missingField("app"))
+    case .success(let request):
+        Issue.record("should have refused, decoded \(request)")
+    }
+
+    // Either half alone is a legitimate aim.
+    guard case .success(let appOnly) = HarnessPolicy.decode(
+        line: #"{"id":"2","verb":"focus","app":"Finder"}"#
+    ) else {
+        Issue.record("app alone should decode")
+        return
+    }
+    #expect(appOnly.app == "Finder")
+    #expect(appOnly.title.isEmpty)
+    #expect(appOnly.verb.isMutating)
+    // Focus does not resolve a name inside a window tree, so it never enters
+    // the name-resolving path.
+    #expect(appOnly.verb.elementAction == nil)
+
+    guard case .success(let titleOnly) = HarnessPolicy.decode(
+        line: #"{"id":"3","verb":"focus","title":"Documents"}"#
+    ) else {
+        Issue.record("title alone should decode")
+        return
+    }
+    #expect(titleOnly.app == nil)
+    #expect(titleOnly.title == "Documents")
+
+    // Reading what could be focused is not a mutation, and needs no app.
+    guard case .success(let listing) = HarnessPolicy.decode(line: #"{"id":"4","verb":"windows"}"#) else {
+        Issue.record("windows needs no field at all")
+        return
+    }
+    #expect(listing.verb.isMutating == false)
+    #expect(listing.verb.elementAction == nil)
+    #expect(listing.app == nil)
+
+    // And the kill switch draws the line between them.
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .focus, killSwitchPresent: true) != nil)
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .windows, killSwitchPresent: true) == nil)
+}
+
+@Test func anApplicationMatchesOnBundleIdBeforeNameBeforePrefix() async throws {
+    let candidates = [
+        AccessibilityWindows.ApplicationCandidate(bundleIdentifier: "com.apple.finder", localizedName: "Finder"),
+        AccessibilityWindows.ApplicationCandidate(bundleIdentifier: "com.apple.mail", localizedName: "Mail"),
+        AccessibilityWindows.ApplicationCandidate(bundleIdentifier: "com.freron.MailMate", localizedName: "MailMate")
+    ]
+
+    // Tier 1, and case-insensitively.
+    #expect(AccessibilityWindows.matchApplication("COM.APPLE.MAIL", among: candidates)
+        == .resolved(index: 1, tier: .bundleIdentifier))
+
+    // Tier 2 beats tier 3, which is the whole point of tiering: "Mail" is an
+    // exact name AND a prefix of "MailMate". Merged, a precise query would be
+    // ambiguous.
+    #expect(AccessibilityWindows.matchApplication("mail", among: candidates)
+        == .resolved(index: 1, tier: .name))
+
+    // Tier 3 only when the exact tiers found nothing.
+    #expect(AccessibilityWindows.matchApplication("Mailm", among: candidates)
+        == .resolved(index: 2, tier: .namePrefix))
+
+    // Two in the chosen tier is a question, never a coin flip.
+    #expect(AccessibilityWindows.matchApplication("Mai", among: candidates)
+        == .ambiguous(matchCount: 2, tier: .namePrefix))
+
+    // A miss says what WAS running, or it is not actionable.
+    #expect(AccessibilityWindows.matchApplication("Xcode", among: candidates)
+        == .notFound(available: ["Finder", "Mail", "MailMate"]))
+}
+
+@Test func aWindowMatchesExactlyBeforeLooselyAndAPointOnlyDecidesWhenItIsAlone() async throws {
+    func window(_ title: String?, _ frame: CGRect = .zero) -> AccessibilityWindows.WindowCandidate {
+        AccessibilityWindows.WindowCandidate(title: title, frameInAppKitCoordinates: frame)
+    }
+
+    let left = CGRect(x: 0, y: 0, width: 600, height: 500)
+    let right = CGRect(x: 800, y: 0, width: 600, height: 500)
+
+    // Exact wins over a longer title that merely contains it.
+    let decorated = [window("Documents — 41 items"), window("Documents")]
+    #expect(AccessibilityWindows.matchWindow(title: "documents", nearPoint: nil, among: decorated)
+        == .resolved(index: 1))
+
+    // Substring is the fallback, because apps decorate their titles.
+    #expect(AccessibilityWindows.matchWindow(title: "41 items", nearPoint: nil, among: decorated)
+        == .resolved(index: 0))
+
+    // Two windows on the same folder: the point separates them.
+    let twoDocuments = [window("Documents", left), window("Documents", right)]
+    #expect(AccessibilityWindows.matchWindow(
+        title: "Documents", nearPoint: CGPoint(x: 900, y: 100), among: twoDocuments
+    ) == .resolved(index: 1))
+
+    // The point lands inside BOTH — overlapping windows are the ordinary case
+    // on a Mac — so it decided nothing and the answer stays ambiguous. Never
+    // "nearest": nearest always returns something, and something is what a
+    // wrong window raised looks like.
+    let stacked = [window("Documents", left), window("Documents", left)]
+    #expect(AccessibilityWindows.matchWindow(
+        title: "Documents", nearPoint: CGPoint(x: 100, y: 100), among: stacked
+    ) == .ambiguous(matchCount: 2))
+
+    // A point inside neither is the same non-answer.
+    #expect(AccessibilityWindows.matchWindow(
+        title: "Documents", nearPoint: CGPoint(x: 5_000, y: 5_000), among: twoDocuments
+    ) == .ambiguous(matchCount: 2))
+
+    // No point at all, two matches: still a question.
+    #expect(AccessibilityWindows.matchWindow(title: "Documents", nearPoint: nil, among: twoDocuments)
+        == .ambiguous(matchCount: 2))
+
+    #expect(AccessibilityWindows.matchWindow(title: "Inbox", nearPoint: nil, among: twoDocuments)
+        == .notFound(available: ["Documents", "Documents"]))
+}
+
+@Test func focusIsAllowedUnlessTheTargetIsUnclearOrTheTitleIsNotALabel() async throws {
+    // Bringing a window forward destroys nothing and the human undoes it with
+    // one click, so it is not worth a confirmation prompt.
+    #expect(ActionSafetyKernel.evaluateFocus(windowTitle: UntrustedText("Documents"), matchCount: 1) == .allow)
+    // Focusing an app by name carries no window title at all.
+    #expect(ActionSafetyKernel.evaluateFocus(windowTitle: nil, matchCount: 1) == .allow)
+
+    #expect(ActionSafetyKernel.evaluateFocus(windowTitle: UntrustedText("Documents"), matchCount: 3)
+        == .refuse(reason: "3 windows match that title"))
+
+    // A newline in a window title can forge a line in anything line-oriented,
+    // and a title that long is content, not a name.
+    #expect(ActionSafetyKernel.evaluateFocus(windowTitle: UntrustedText("Doc\numents"), matchCount: 1)
+        == .refuse(reason: ActionSafetyKernel.implausibleNameRefusalReason))
+    #expect(ActionSafetyKernel.evaluateFocus(windowTitle: UntrustedText(""), matchCount: 1)
+        == .refuse(reason: ActionSafetyKernel.implausibleNameRefusalReason))
+
+    // Ambiguity outranks the name check — a refusal that names the wrong reason
+    // sends the caller after the wrong fix.
+    #expect(ActionSafetyKernel.evaluateFocus(windowTitle: UntrustedText(""), matchCount: 2)
+        == .refuse(reason: "2 windows match that title"))
 }

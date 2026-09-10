@@ -41,6 +41,10 @@ struct HarnessRawRequest: Decodable {
     /// menu / menus only: the path down the menu bar, e.g. ["File", "New Folder"].
     let path: [String]?
 
+    /// windows / focus only: which application, by bundle identifier or name.
+    /// Absent means the frontmost one, which is what every other verb assumes.
+    let app: String?
+
     // type only
     let text: String?
     let mode: String?
@@ -70,13 +74,20 @@ enum HarnessVerb: String, CaseIterable {
     /// would put that on every read.
     case menus
 
+    /// What windows an application has, and what applications are running.
+    /// Read-only, and the applications half costs no AX reads at all.
+    case windows
+    /// Point the harness at a different window. Every other verb anchors on
+    /// whatever the human left in front; this is how a caller moves that anchor.
+    case focus
+
     /// Whether this verb can change the world. The kill switch stops these and
     /// leaves the read-only pair working, so an operator who tripped it can
     /// still look at the machine and find out why.
     var isMutating: Bool {
         switch self {
-        case .ping, .snapshot, .menus: return false
-        case .press, .select, .type, .open, .menu: return true
+        case .ping, .snapshot, .menus, .windows: return false
+        case .press, .select, .type, .open, .menu, .focus: return true
         }
     }
 
@@ -90,7 +101,11 @@ enum HarnessVerb: String, CaseIterable {
         // it does not go through the name-resolving path at all. Returning nil
         // here is what keeps the "an acting verb needs a title" rule honest —
         // a menu request carries a path instead.
-        case .ping, .snapshot, .menu, .menus: return nil
+        //
+        // `focus` acts too, and is nil here for the same reason: its target is a
+        // window, not a named element inside one, so it never enters the
+        // name-resolving path and its kernel check is `evaluateFocus`.
+        case .ping, .snapshot, .menu, .menus, .windows, .focus: return nil
         }
     }
 }
@@ -154,6 +169,9 @@ struct HarnessRequest: Equatable {
 
     /// menu / menus only.
     var path: [String] = []
+
+    /// windows / focus only. nil means the frontmost application.
+    var app: String? = nil
 }
 
 // MARK: - Pure decision logic
@@ -206,6 +224,13 @@ enum HarnessPolicy {
             return .failure(.missingField("path"))
         }
 
+        // `focus` aims with either half: an app (bring Finder forward), a title
+        // (raise that window in whatever is already frontmost), or both.
+        // Neither is not a default — it is a request to focus nothing.
+        if verb == .focus, (raw.app ?? "").isEmpty, (raw.title ?? "").isEmpty {
+            return .failure(.missingField("app"))
+        }
+
         var mode = TypeMode.insert
         if verb == .type {
             guard !(raw.text ?? "").isEmpty else {
@@ -237,7 +262,8 @@ enum HarnessPolicy {
             mode: mode,
             aimAtFocus: aimAtFocus,
             thenConfirm: raw.thenConfirm ?? false,
-            path: path
+            path: path,
+            app: (raw.app?.isEmpty == false) ? raw.app : nil
         ))
     }
 
@@ -469,6 +495,17 @@ final class HarnessServer {
     static let auditLogRotationBytes = 5 * 1024 * 1024
     static let maximumAnomalyDumps = 5
 
+    /// How long the same rule, on the same app, stops writing another file.
+    ///
+    /// Measured on this machine 2026-09-10: five dumps on disk, all
+    /// `response error is not an ordinary refusal`, all System Settings, all
+    /// inside **1.7 seconds** — 125 KB describing one cause, and between them
+    /// they filled the entire five-file budget, so any *different* anomaly in
+    /// that session had nowhere to land. A recorder that evicts its own
+    /// variety is worse than a smaller one. The recurrence is not lost: the
+    /// audit line still fires every time, as `anomalySuppressed`.
+    static let anomalyDumpSuppressionInSeconds: TimeInterval = 60
+
     /// One per app launch. Two runs of the harness append to the same file, and
     /// without this their lines are indistinguishable — including a stale
     /// binary's, which this project has already been fooled by once.
@@ -492,6 +529,10 @@ final class HarnessServer {
     /// A cross-app median measures which app you switched to, and an anomaly
     /// rule that fires on an app switch is one that gets switched off.
     private var recentWalkMillisecondsByApp: [String: RingBuffer<Int>] = [:]
+
+    /// Last time a dump was written, keyed by rule and app. Two entries, not a
+    /// ring — the whole point is that repetition is cheap to recognise.
+    private var lastAnomalyDumpAt: [String: Date] = [:]
 
     init(globalDryRun: Bool) {
         self.globalDryRun = globalDryRun
@@ -729,20 +770,44 @@ final class HarnessServer {
 
         guard let anomaly else { return response }
 
+        // Same rule, same app, within the window: record that it happened and
+        // do not spend 25 KB saying it again. The ring buffer behind a second
+        // dump is nearly the same twenty requests anyway.
+        let app = Self.frontmostBundleIdentifier() ?? "unknown"
+        let dumpKey = "\(anomaly.rawValue)|\(app)"
+        let now = Date()
+        let suppressed = lastAnomalyDumpAt[dumpKey].map {
+            now.timeIntervalSince($0) < Self.anomalyDumpSuppressionInSeconds
+        } ?? false
+
         var annotated = response
-        if let dumpPath = writeAnomalyDump(anomaly, walkedApp: walkedApp, recentWalks: recentWalks.elements) {
+        var outcome = "anomalyNotWritten"
+        if suppressed {
+            outcome = "anomalySuppressed"
+            annotated["anomaly"] = [
+                "rule": anomaly.rawValue,
+                "dump": NSNull(),
+                "suppressed": "same rule and app dumped within the last \(Int(Self.anomalyDumpSuppressionInSeconds))s"
+            ]
+        } else if let dumpPath = writeAnomalyDump(
+            anomaly, walkedApp: walkedApp, recentWalks: recentWalks.elements
+        ) {
+            lastAnomalyDumpAt[dumpKey] = now
+            outcome = "anomaly"
             annotated["anomaly"] = ["rule": anomaly.rawValue, "dump": dumpPath]
-            // One audit line naming the rule, so the log alone tells you a dump
-            // exists and what to look for in it.
-            appendAudit(HarnessPolicy.auditLine(
-                at: Date(), id: (response["id"] as? String) ?? "", verb: verb,
-                target: anomaly.rawValue,
-                app: Self.frontmostBundleIdentifier(), session: Self.sessionIdentifier,
-                dryRun: globalDryRun, confirmed: false,
-                kernel: "n/a", outcome: "anomaly",
-                milliseconds: elapsedMilliseconds(since: startedAt)
-            ))
         }
+
+        // One audit line naming the rule, on every anomaly including a
+        // suppressed one — otherwise the log would say a recurring problem
+        // stopped happening the moment we stopped writing files about it.
+        appendAudit(HarnessPolicy.auditLine(
+            at: now, id: (response["id"] as? String) ?? "", verb: verb,
+            target: anomaly.rawValue,
+            app: Self.frontmostBundleIdentifier(), session: Self.sessionIdentifier,
+            dryRun: globalDryRun, confirmed: false,
+            kernel: "n/a", outcome: outcome,
+            milliseconds: elapsedMilliseconds(since: startedAt)
+        ))
         return annotated
     }
 
@@ -835,6 +900,12 @@ final class HarnessServer {
 
         case .menus:
             return menusResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .windows:
+            return windowsResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .focus:
+            return focusResponse(request, dryRun: dryRun, startedAt: startedAt)
         }
     }
 
@@ -1467,6 +1538,301 @@ final class HarnessServer {
         return response
     }
 
+    // MARK: windows / focus
+
+    // Both window verbs report their timing as `focusMilliseconds`, never as
+    // `walkMilliseconds` — for the reason spelled out in full above
+    // `// MARK: menu / menus`. A window-list read is a third population and
+    // `observe` keys the slow-walk median on `walkMilliseconds` alone.
+
+    /// The application both verbs act on: the one named, or the frontmost.
+    /// Returns nil having already filled in the refusal and written the audit
+    /// line, exactly like `menuBar(for:)`.
+    private func targetApplication(
+        for request: HarnessRequest,
+        dryRun: Bool,
+        startedAt: Date,
+        into response: inout [String: Any]
+    ) -> NSRunningApplication? {
+
+        func fail(_ code: String, _ message: String, extra: [String: Any] = [:]) {
+            response["ok"] = false
+            response["error"] = code
+            response["message"] = message
+            for (key, value) in extra { response[key] = value }
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: code, startedAt: startedAt)
+        }
+
+        // Same guard the walker and the menu path have. A locked screen makes
+        // loginwindow frontmost, and its one window is a believable, wrong
+        // answer that this project has already recorded as data three times.
+        guard !LockScreenGuard.isLockScreen(Self.frontmostBundleIdentifier()) else {
+            fail("screenIsLocked", "the screen is locked — there are no windows of the user's to read or raise")
+            return nil
+        }
+
+        let candidates = AccessibilityWindows.runningApplications()
+
+        guard let query = request.app else {
+            guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+                fail("noFrontmostApplication", "nothing is frontmost")
+                return nil
+            }
+            return frontmost
+        }
+
+        switch AccessibilityWindows.matchApplication(query, among: candidates.map(\.candidate)) {
+        case .resolved(let index, let tier):
+            response["applicationMatchedOn"] = tier.rawValue
+            return candidates[index].application
+        case .notFound(let available):
+            fail(
+                "notFound",
+                "no running application matches \(UntrustedText(query).forDisplay)",
+                // What WAS running. Without it a miss is not actionable — the
+                // caller cannot tell a typo from an app that is not open.
+                extra: ["available": available.map { UntrustedText($0).forDisplay }]
+            )
+            return nil
+        case .ambiguous(let matchCount, let tier):
+            fail(
+                "ambiguous",
+                "\(matchCount) running applications match \(UntrustedText(query).forDisplay) on \(tier.rawValue)",
+                extra: ["matchCount": matchCount]
+            )
+            return nil
+        }
+    }
+
+    /// The wire form of one running application. `NSWorkspace` only — no AX
+    /// reads, so this list is nearly free, and it is how a caller finds out what
+    /// it could focus in the first place.
+    private static func summariseApplication(
+        _ candidate: AccessibilityWindows.ApplicationCandidate
+    ) -> [String: Any] {
+        [
+            "name": (candidate.localizedName ?? NSNull()) as Any,
+            "bundleIdentifier": (candidate.bundleIdentifier ?? NSNull()) as Any,
+            "active": candidate.isActive,
+            "hidden": candidate.isHidden
+        ]
+    }
+
+    /// The wire form of one window. Frames are already AppKit — converted in
+    /// `liveWindows`, at the one boundary where AX's top-left origin meets
+    /// AppKit's bottom-left.
+    private static func summariseWindow(
+        _ candidate: AccessibilityWindows.WindowCandidate
+    ) -> [String: Any] {
+        let frame = candidate.frameInAppKitCoordinates
+        return [
+            // Raw, because JSON encoding is the escaping — same rule as
+            // `summarise`. The plausibility flag travels beside it.
+            "title": (candidate.title?.raw ?? NSNull()) as Any,
+            "titleIsPlausibleLabel": candidate.title?.isPlausibleControlLabel ?? false,
+            "role": candidate.role,
+            "subrole": (candidate.subrole ?? NSNull()) as Any,
+            "frame": ["x": frame.origin.x, "y": frame.origin.y, "w": frame.size.width, "h": frame.size.height],
+            "main": candidate.isMain,
+            "minimized": candidate.isMinimized,
+            "actions": candidate.publishedActionNames
+        ]
+    }
+
+    private func windowsResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        var response: [String: Any] = [:]
+        guard let application = targetApplication(
+            for: request, dryRun: dryRun, startedAt: startedAt, into: &response
+        ) else { return response }
+
+        response["application"] = application.localizedName ?? "unknown"
+        response["bundleIdentifier"] = application.bundleIdentifier ?? "unknown"
+
+        let readStartedAt = Date()
+        let read = AccessibilityWindows.liveWindows(for: application)
+        response["focusMilliseconds"] = Int(Date().timeIntervalSince(readStartedAt) * 1000)
+
+        response["windowCount"] = read.windows.count
+        response["windows"] = read.windows.map { Self.summariseWindow($0.candidate) }
+        response["applications"] = AccessibilityWindows.runningApplications()
+            .map { Self.summariseApplication($0.candidate) }
+
+        // A count of zero is only a fact if the read worked. This is the one
+        // field that separates "this app has no windows" from "this app did not
+        // answer", and without it both print as `windowCount: 0`.
+        response["windowListRead"] = read.readSucceeded ? "ok" : "failed"
+        response["windowListErrorRawValue"] = read.error.rawValue
+        // Zero windows from a *successful* read is still not "this app has no
+        // windows" — kAXWindows is Space-scoped, measured 2026-09-10. Say so
+        // where the count is, not in a footnote.
+        if read.readSucceeded, read.windows.isEmpty, !application.isActive {
+            response["warning"] = "ZERO IS NOT A MEASUREMENT — \(application.localizedName ?? "this app") "
+                + "is not the active application, and kAXWindows only lists windows on the active Space. "
+                + "Focus the app and read again before concluding it has no windows."
+        }
+        if !read.readSucceeded {
+            response["warning"] = "WINDOW COUNT IS NOT A MEASUREMENT — "
+                + "kAXWindows failed with AXError \(read.error.rawValue); the list below is empty "
+                + "because the read did not answer, not because the app has no windows"
+        }
+        response["ok"] = read.readSucceeded
+        if !read.readSucceeded { response["error"] = "windowListUnreadable" }
+        audit(
+            request, dryRun: dryRun, kernel: "n/a",
+            outcome: read.readSucceeded ? "ok" : "windowListUnreadable", startedAt: startedAt
+        )
+        return response
+    }
+
+    private func focusResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        var response: [String: Any] = [
+            "dryRun": dryRun, "confirmed": request.confirmed,
+            "app": (request.app ?? NSNull()) as Any,
+            "title": request.title.isEmpty ? NSNull() : request.title
+        ]
+
+        // Captured BEFORE anything moves. Focus is the one verb the human can
+        // undo trivially, and this is what tells them how.
+        if let previous = AccessibilityWindows.previousApplication() {
+            response["previousApplication"] = [
+                "name": (previous.name ?? NSNull()) as Any,
+                "bundleIdentifier": (previous.bundleIdentifier ?? NSNull()) as Any
+            ]
+        }
+
+        guard let application = targetApplication(
+            for: request, dryRun: dryRun, startedAt: startedAt, into: &response
+        ) else { return response }
+
+        response["application"] = application.localizedName ?? "unknown"
+        response["bundleIdentifier"] = application.bundleIdentifier ?? "unknown"
+
+        // A title-less focus is an app activation, and reading the window list
+        // is then only worth it to say which window ends up in front — which
+        // the observation tier reports anyway. So it is read either way, once.
+        let readStartedAt = Date()
+        var read = AccessibilityWindows.liveWindows(for: application)
+
+        // A window on another Space is invisible to kAXWindows, so resolving a
+        // title against an empty list would report `notFound` for a window that
+        // is merely elsewhere. Bringing the app forward IS the app-level half of
+        // this verb — the half the kernel allows unconditionally — so doing it
+        // first is the verb's own order, not an escalation past a decision.
+        if !request.title.isEmpty, read.windows.isEmpty, !application.isActive {
+            let attempt = AccessibilityWindows.activateAndWaitForWindows(application)
+            read = attempt.read
+            response["activatedToReadWindows"] = [
+                "activated": attempt.activated,
+                "milliseconds": attempt.milliseconds,
+                "windowsThenVisible": attempt.read.windows.count
+            ]
+        }
+        response["focusMilliseconds"] = Int(Date().timeIntervalSince(readStartedAt) * 1000)
+        response["windowCount"] = read.windows.count
+        response["windowListRead"] = read.readSucceeded ? "ok" : "failed"
+
+        // A title we cannot look for is not a title that is missing. Reporting
+        // `notFound` here would tell the caller the window does not exist, on
+        // the strength of a read that never happened.
+        if !request.title.isEmpty, !read.readSucceeded {
+            response["ok"] = false
+            response["error"] = "windowListUnreadable"
+            response["message"] = "kAXWindows failed with AXError \(read.error.rawValue) — "
+                + "cannot tell whether that window exists"
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: "windowListUnreadable", startedAt: startedAt)
+            return response
+        }
+
+        var resolvedWindow: (element: AXUIElement, candidate: AccessibilityWindows.WindowCandidate)?
+        var matchCount = 1
+        var kernelTitle: UntrustedText?
+
+        if !request.title.isEmpty {
+            switch AccessibilityWindows.matchWindow(
+                title: request.title, nearPoint: request.nearPoint,
+                among: read.windows.map(\.candidate)
+            ) {
+            case .resolved(let index):
+                resolvedWindow = read.windows[index]
+                kernelTitle = read.windows[index].candidate.title
+                response["resolution"] = [
+                    "status": "resolved", "matchCount": 1,
+                    "title": (read.windows[index].candidate.title?.raw ?? NSNull()) as Any
+                ]
+            case .notFound(let available):
+                response["resolution"] = [
+                    "status": "notFound",
+                    "available": available.map { UntrustedText($0).forDisplay }
+                ]
+                response["ok"] = false
+                response["error"] = "notFound"
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
+                return response
+            case .ambiguous(let count):
+                // Not returned here: the kernel is the thing that refuses an
+                // ambiguous target, in this verb as in every other.
+                matchCount = count
+                kernelTitle = UntrustedText(request.title)
+                response["resolution"] = ["status": "ambiguous", "matchCount": count]
+            }
+        }
+
+        let decision = ActionSafetyKernel.evaluateFocus(windowTitle: kernelTitle, matchCount: matchCount)
+        let described = HarnessPolicy.describe(decision)
+        let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
+        response["kernel"] = [
+            "decision": described.decision,
+            "reason": (described.reason ?? NSNull()) as Any,
+            "executable": executability.executable,
+            "note": (executability.reason ?? NSNull()) as Any
+        ]
+
+        guard executability.executable else {
+            response["ok"] = false
+            response["error"] = described.decision == "refuse" ? "kernelRefused" : "confirmationRequired"
+            audit(request, dryRun: dryRun, kernel: described.decision,
+                  outcome: described.decision == "refuse" ? "kernelRefused" : "confirmationRequired",
+                  startedAt: startedAt)
+            return response
+        }
+
+        guard !dryRun else {
+            response["ok"] = true
+            response["performed"] = ["status": "skipped", "reason": "dry run — nothing was performed"]
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "dryRun", startedAt: startedAt)
+            return response
+        }
+
+        let outcome = AccessibilityWindows.focus(application: application, window: resolvedWindow)
+
+        // Every step separately. A raise that was never published, a raise that
+        // returned 0, and a window that actually came forward are three
+        // different facts, and collapsing them into one boolean is how a write
+        // that did nothing gets reported as a success.
+        response["performed"] = [
+            "unminimized": outcome.unminimized,
+            "unminimizeErrorRawValue": (outcome.unminimizeErrorRawValue.map { Int($0) } ?? NSNull()) as Any,
+            "raisePublished": outcome.raisePublished,
+            "axErrorRawValue": (outcome.raiseErrorRawValue.map { Int($0) } ?? NSNull()) as Any,
+            "milliseconds": (outcome.raiseMilliseconds ?? NSNull()) as Any,
+            "activated": outcome.activated
+        ]
+        response["verification"] = [
+            "status": outcome.observed ? "confirmed" : "notObserved",
+            "readBackMain": (outcome.readBackMain ?? NSNull()) as Any,
+            "observed": outcome.observed,
+            "milliseconds": outcome.observedMilliseconds,
+            "observedApplication": (outcome.observedApplication ?? NSNull()) as Any,
+            "observedWindowTitle": (outcome.observedWindowTitle?.raw ?? NSNull()) as Any
+        ]
+
+        response["ok"] = outcome.observed
+        if !outcome.observed { response["error"] = "notVerified" }
+        audit(request, dryRun: dryRun, kernel: described.decision,
+              outcome: outcome.observed ? "confirmed" : "notObserved", startedAt: startedAt)
+        return response
+    }
+
     // MARK: Audit
 
     private func audit(
@@ -1480,7 +1846,11 @@ final class HarnessServer {
             at: startedAt,
             id: request.id,
             verb: request.verb.rawValue,
-            target: request.title.isEmpty ? (request.aimAtFocus ? "<focused>" : nil) : request.title,
+            // A focus request may name only an app, and a mutating verb whose
+            // audit line does not say what it acted on is half a record.
+            target: request.title.isEmpty
+                ? (request.aimAtFocus ? "<focused>" : request.app)
+                : request.title,
             app: Self.frontmostBundleIdentifier(),
             session: Self.sessionIdentifier,
             dryRun: dryRun,

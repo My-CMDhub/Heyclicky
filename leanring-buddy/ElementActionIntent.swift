@@ -55,6 +55,26 @@ enum ElementAction {
         }
     }
 
+    /// Whether a name from `ActionSafetyKernel.irreversibleTitleKeywords` should
+    /// refuse this verb outright.
+    ///
+    /// False for `select` alone, and the reason is a false positive with a real
+    /// cost: **Music and the App Store both label a sidebar row "Purchased"**,
+    /// which contains "purchase". Selecting a row named "Purchased" does not buy
+    /// anything — a selection write changes what is selected and, as the note on
+    /// `navigationalSelectRoles` says, cannot activate anything else. Refusing it
+    /// would make those lists unreachable while preventing nothing.
+    ///
+    /// `type` stays true deliberately. "Type ERASE to confirm" is a real dialog
+    /// pattern, so a field labelled with an irreversible word is precisely the
+    /// one this agent must not fill in.
+    var irreversibleNamesAreRefused: Bool {
+        switch self {
+        case .press, .type, .open, .menu: return true
+        case .select: return false
+        }
+    }
+
     /// Whether this verb's target is something drawn on screen, so that its
     /// frame is evidence about whether we can act on it.
     ///
