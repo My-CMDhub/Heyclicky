@@ -1915,10 +1915,10 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
     // The crop taken to disambiguate a button is still a picture of everything
     // else in the rectangle. A screenshot of a password field is a credential
     // on disk, and no later refusal takes it back.
-    let refusal = ActionSafetyKernel.evaluateCapture(elementsInRegion: [
-        typingNode(role: "AXButton", name: "Sign In"),
-        typingNode(role: "AXTextField", subrole: "AXSecureTextField", name: "Password")
-    ])
+    let secureField = typingNode(role: "AXTextField", subrole: "AXSecureTextField", name: "Password")
+    let refusal = ActionSafetyKernel.evaluateCapture(CaptureInspection(windows: [
+        .init(title: UntrustedText("Sign In"), nodes: [typingNode(role: "AXButton", name: "Sign In"), secureField])
+    ]))
     guard case .refuse(let reason) = refusal else {
         Issue.record("a secure field in the region must be refused, got \(refusal)")
         return
@@ -1928,11 +1928,90 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
     // attempt, so it earns the last twenty requests on disk.
     #expect(ActionSafetyKernel.isSecurityRefusal(reason: reason))
 
-    #expect(ActionSafetyKernel.evaluateCapture(elementsInRegion: [
-        typingNode(role: "AXButton", name: "Sign In"),
-        typingNode(role: "AXTextField", name: "Email")
-    ]) == .allow)
-    #expect(ActionSafetyKernel.evaluateCapture(elementsInRegion: []) == .allow)
+    // Seen inside a walk that then stopped is still seen: the stronger answer
+    // wins over "the check was incomplete".
+    #expect(ActionSafetyKernel.evaluateCapture(CaptureInspection(windows: [
+        .init(nodes: [secureField], stopReasons: [.timeLimit])
+    ])) == refusal)
+
+    #expect(ActionSafetyKernel.evaluateCapture(CaptureInspection(windows: [
+        .init(title: UntrustedText("Sign In"), nodes: [
+            typingNode(role: "AXButton", name: "Sign In"),
+            typingNode(role: "AXTextField", name: "Email")
+        ])
+    ])) == .allow)
+}
+
+@Test func anIncompleteSecureFieldCheckIsARefusalNotAPass() async throws {
+    // An empty or partial element list and a genuinely safe region both used to
+    // produce `.allow`. Every way the inspection can fall short must refuse.
+    let clean = [typingNode(role: "AXButton", name: "Sign In"), typingNode(role: "AXTextField", name: "Email")]
+    let prefix = "refusing to capture: the secure-field check could not inspect the whole region"
+    #expect(ActionSafetyKernel.incompleteCaptureCheckRefusalPrefix == prefix)
+
+    func refusalReason(_ inspection: CaptureInspection) -> String? {
+        let decision = ActionSafetyKernel.evaluateCapture(inspection)
+        guard case .refuse(let reason) = decision else { return nil }
+        // No `confirmed: true` lifts it, and it earns the flight recorder.
+        #expect(HarnessPolicy.executability(of: decision, confirmed: true).executable == false)
+        #expect(ActionSafetyKernel.isSecurityRefusal(reason: reason))
+        return reason
+    }
+
+    // Each limit, on the second of two windows: the reason names which window
+    // and which limit, and not the window that finished.
+    for limit in WalkStopReason.allCases {
+        let reason = try #require(refusalReason(CaptureInspection(windows: [
+            .init(title: UntrustedText("Inbox"), nodes: clean),
+            .init(title: UntrustedText("Login"), nodes: clean, stopReasons: [limit])
+        ])))
+        #expect(reason.hasPrefix(prefix))
+        #expect(reason.contains("\"Login\""))
+        #expect(!reason.contains("\"Inbox\""))
+        #expect(reason.contains(limit.rawValue))
+    }
+
+    // The window list itself unreadable: nothing known, not nothing there.
+    let unread = try #require(refusalReason(CaptureInspection(windowListReadError: -25204)))
+    #expect(unread.hasPrefix(prefix))
+    #expect(unread.contains("-25204"))
+
+    // A walk that never ran, and a subtree dropped by a failed children read.
+    let neverRan = try #require(refusalReason(CaptureInspection(windows: [
+        .init(title: UntrustedText("Login"), failure: "screenIsLocked")
+    ])))
+    #expect(neverRan.hasPrefix(prefix) && neverRan.contains("screenIsLocked"))
+    let lostSubtree = try #require(refusalReason(CaptureInspection(windows: [
+        .init(nodes: clean, subtreesLostToFailedReads: 2)
+    ])))
+    #expect(lostSubtree.hasPrefix(prefix) && lostSubtree.contains("#0"))
+
+    // Allowed only when every walk finished clean. Zero windows with a
+    // successful list read is complete: the capture includes only this app, so
+    // a region none of its windows touch holds none of its pixels.
+    #expect(ActionSafetyKernel.evaluateCapture(CaptureInspection(windows: [
+        .init(nodes: clean), .init(nodes: clean)
+    ])) == .allow)
+    #expect(ActionSafetyKernel.evaluateCapture(CaptureInspection()) == .allow)
+    #expect(CaptureInspection().incompleteReason == nil)
+}
+
+@Test func onlyWindowsTouchingTheCaptureRegionAreInspected() async throws {
+    let region = CGRect(x: 100, y: 100, width: 200, height: 200)   // x and y 100...300
+    let frames = [
+        CGRect(x: 150, y: 150, width: 50, height: 50),     // 0 inside
+        CGRect(x: 250, y: 250, width: 200, height: 200),   // 1 overlapping a corner
+        CGRect(x: 400, y: 100, width: 100, height: 100),   // 2 clear to the right
+        CGRect(x: 300, y: 120, width: 80, height: 40),     // 3 sharing only the right edge
+        CGRect(x: 0, y: 0, width: 1000, height: 1000),     // 4 containing the region
+        CGRect(x: 100, y: 0, width: 200, height: 99),      // 5 one point short below
+        .zero                                              // 6 frame unreadable: position unknown
+    ]
+    // The stdlib calls an edge-only contact "not intersecting"; a capture that
+    // rounds points to pixels can still take a row from it, so it is walked.
+    #expect(!frames[3].intersects(region))
+    #expect(EscalationLadder.windowIndices(intersecting: region, windowFrames: frames) == [0, 1, 3, 4, 6])
+    #expect(EscalationLadder.windowIndices(intersecting: region, windowFrames: []) == [])
 }
 
 @Test func anUnrecognisedTierIsRejectedRatherThanIgnored() async throws {
@@ -1968,4 +2047,49 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
         return
     }
     #expect(escalating.escalate)
+}
+
+@Test func aTextFieldWhoseSubroleCouldNotBeReadMakesTheCaptureCheckIncomplete() async throws {
+    // A password box is told apart from any other text box only by its
+    // subrole. A timed-out subrole read used to arrive as nil — "not a password
+    // box" — and the capture check passed it.
+    let unreadableField = AccessibilityElementNode(
+        role: "AXTextField", subrole: nil, title: "Password", value: nil,
+        frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 200, height: 24),
+        depth: 1, children: [], subroleReadFailed: true
+    )
+    var fieldWalk = CaptureInspection.WindowWalk()
+    fieldWalk.nodes = [unreadableField]
+    let decision = ActionSafetyKernel.evaluateCapture(CaptureInspection(windows: [fieldWalk]))
+    guard case .refuse(let reason) = decision else {
+        Issue.record("expected a refusal, got \(decision)")
+        return
+    }
+    #expect(reason.hasPrefix(ActionSafetyKernel.incompleteCaptureCheckRefusalPrefix))
+    #expect(ActionSafetyKernel.isSecurityRefusal(reason: reason))
+
+    // A button cannot be a password box, so the same failed read on one must
+    // not refuse — otherwise every capture of a busy app would.
+    let unreadableButton = AccessibilityElementNode(
+        role: "AXButton", subrole: nil, title: "OK", value: nil,
+        frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 80, height: 24),
+        depth: 1, children: [], subroleReadFailed: true
+    )
+    var buttonWalk = CaptureInspection.WindowWalk()
+    buttonWalk.nodes = [unreadableButton]
+    #expect(ActionSafetyKernel.evaluateCapture(CaptureInspection(windows: [buttonWalk])) == .allow)
+}
+
+@Test func aRegionWithOnlyTheDesktopHasNothingToPhotograph() async throws {
+    // Finder's desktop is an AXScrollArea, and a one-app capture draws no
+    // desktop — measured 2026-09-11 as an `ok: true` blank white image.
+    var desktop = CaptureInspection.WindowWalk()
+    desktop.role = "AXScrollArea"
+    #expect(!CaptureInspection(windows: [desktop]).containsDrawableWindow)
+    // No window touching the region at all is the same answer.
+    #expect(!CaptureInspection(windows: []).containsDrawableWindow)
+
+    var window = CaptureInspection.WindowWalk()
+    window.role = "AXWindow"
+    #expect(CaptureInspection(windows: [desktop, window]).containsDrawableWindow)
 }

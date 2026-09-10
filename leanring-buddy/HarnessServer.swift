@@ -462,7 +462,12 @@ enum HarnessObservability {
         // A kernel refusal is the policy working, and the audit line already
         // says which rule fired. Only a refusal on SECURITY grounds is worth a
         // dump — see `kernelReason` below.
-        "kernelRefused"
+        "kernelRefused",
+        // An app with no ordinary on-screen window — measured 2026-09-11,
+        // Finder showing only its desktop — is not listed by ScreenCaptureKit,
+        // so the one-app capture refuses. Explained and safe; three dumps of it
+        // in one session were a recorder filing the expected as a surprise.
+        "applicationNotCapturable"
     ]
 
     /// Below this many samples the median is noise, and a cold start would fire
@@ -1808,7 +1813,10 @@ final class HarnessServer {
                 ]
                 response["ok"] = false
                 response["error"] = "notFound"
-                attachFocusEscalation(to: &response, request: request, windows: read.windows.map(\.candidate))
+                attachFocusEscalation(
+                    to: &response, request: request,
+                    windows: read.windows.map(\.candidate), application: application
+                )
                 audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
                 return response
             case .ambiguous(let count):
@@ -1837,7 +1845,10 @@ final class HarnessServer {
             // this verb gets the ladder too — built from the window list, which
             // is the candidate set it resolves against.
             if matchCount != 1 {
-                attachFocusEscalation(to: &response, request: request, windows: read.windows.map(\.candidate))
+                attachFocusEscalation(
+                    to: &response, request: request,
+                    windows: read.windows.map(\.candidate), application: application
+                )
             }
             audit(request, dryRun: dryRun, kernel: described.decision,
                   outcome: described.decision == "refuse" ? "kernelRefused" : "confirmationRequired",
@@ -1891,6 +1902,12 @@ final class HarnessServer {
     // `walkMilliseconds` alone. A `look` still reports the *tree walk* it did as
     // `walkMilliseconds`, because that one really is a window walk of the same
     // window every other verb measures.
+    //
+    // The secure-field inspection before a capture is `inspectMilliseconds`,
+    // for the same reason: it walks every window of the app that touches the
+    // region — one or several, background ones included — so it is a fifth
+    // population, and a multi-window total in `walkMilliseconds` would poison
+    // the per-app median.
 
     /// Which rung, over what rectangle, showing what.
     private struct EscalationPlan {
@@ -1912,10 +1929,10 @@ final class HarnessServer {
         let resolver: String
         /// What a caller would have to choose between.
         let candidates: [AccessibilityElementNode]
-        /// Everything the tree knows is inside the rectangle — the kernel's
-        /// input, and a superset of `candidates` because a secure field is
-        /// almost never the thing that was named.
-        let elementsInRegion: [AccessibilityElementNode]
+        /// The one application a capture may photograph, and whose windows the
+        /// secure-field check walks first. Nil when none could be named — and
+        /// then nothing is photographed, never the whole display instead.
+        let application: NSRunningApplication?
     }
 
     /// The rectangle a display tier would cover: the display holding the
@@ -1937,7 +1954,8 @@ final class HarnessServer {
         forcedTier: EscalationLadder.Tier?,
         title: String,
         role: String?,
-        rootNode: AccessibilityElementNode?
+        rootNode: AccessibilityElementNode?,
+        application: NSRunningApplication?
     ) -> EscalationPlan? {
         let displays = EscalationLadder.displays()
         let allNodes = rootNode?.flattenedDescendants() ?? []
@@ -1974,7 +1992,7 @@ final class HarnessServer {
             // On the window and display rungs nothing was named, so the useful
             // list is what a caller could name instead.
             candidates: choice.tier == .element ? candidates : inRegion.filter(\.isActionable),
-            elementsInRegion: inRegion
+            application: application
         )
     }
 
@@ -1993,9 +2011,12 @@ final class HarnessServer {
     private func attachFocusEscalation(
         to response: inout [String: Any],
         request: HarnessRequest,
-        windows: [AccessibilityWindows.WindowCandidate]
+        windows: [AccessibilityWindows.WindowCandidate],
+        application: NSRunningApplication
     ) {
-        guard let plan = windowEscalationPlan(title: request.title, windows: windows) else { return }
+        guard let plan = windowEscalationPlan(
+            title: request.title, windows: windows, application: application
+        ) else { return }
         let result = escalationPayload(plan: plan, capture: request.escalate)
         var payload = result.payload
         payload["available"] = true
@@ -2013,7 +2034,8 @@ final class HarnessServer {
     /// action list, which is everything the candidate machinery reads.
     private func windowEscalationPlan(
         title: String,
-        windows: [AccessibilityWindows.WindowCandidate]
+        windows: [AccessibilityWindows.WindowCandidate],
+        application: NSRunningApplication
     ) -> EscalationPlan? {
         func node(_ candidate: AccessibilityWindows.WindowCandidate) -> AccessibilityElementNode {
             AccessibilityElementNode(
@@ -2041,9 +2063,10 @@ final class HarnessServer {
             region: region,
             resolver: "windowTitle",
             candidates: candidates,
-            // No tree was walked for another app's windows, so the kernel has
-            // nothing structural to inspect. Reported, never assumed safe.
-            elementsInRegion: []
+            // The resolved app. `focus` has already brought it forward when its
+            // windows were Space-hidden, so a capture can walk them — and a
+            // window read that still fails is a refusal, not a pass.
+            application: application
         )
     }
 
@@ -2112,13 +2135,23 @@ final class HarnessServer {
                 + "of \(plan.candidates.count) candidates, named ones first"
         }
 
-        // The kernel runs before the shutter, not after. A refusal that arrives
-        // once the JPEG is on disk is not a refusal.
-        // Say whether the check could actually look. An empty element list and
-        // a region with genuinely no secure field produce the same `.allow`,
-        // and this project has been bitten six times by exactly that shape.
-        payload["secureFieldCheck"] = plan.elementsInRegion.isEmpty ? "unavailable" : "structural"
-        let decision = ActionSafetyKernel.evaluateCapture(elementsInRegion: plan.elementsInRegion)
+        // Inspect first, then photograph — and the camera may only see what was
+        // inspected. Every window of the one app the capture includes that
+        // touches the region is walked here, before the shutter; a refusal that
+        // arrives once the JPEG is on disk is not a refusal. There is no path
+        // below that photographs without a complete check.
+        guard let application = plan.application else {
+            payload["message"] = "no application to restrict the capture to, and a display-wide capture is never taken"
+            return (payload, "captureFailed")
+        }
+        let inspectStartedAt = Date()
+        let inspection = EscalationLadder.inspectForCapture(region: plan.region, of: application)
+        payload["inspectMilliseconds"] = Int(Date().timeIntervalSince(inspectStartedAt) * 1000)
+        // How many windows were walked. "complete" beside 0 is legitimate only
+        // when no window of the app touches the region — worth being able to see.
+        payload["inspectedWindows"] = inspection.windows.count
+        payload["secureFieldCheck"] = inspection.incompleteReason ?? "complete"
+        let decision = ActionSafetyKernel.evaluateCapture(inspection)
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: false)
         payload["kernel"] = [
@@ -2131,6 +2164,14 @@ final class HarnessServer {
             return (payload, "kernelRefused")
         }
 
+        // Safe to photograph, and nothing to photograph: refuse before the
+        // shutter rather than return `ok: true` and a blank image.
+        guard inspection.containsDrawableWindow else {
+            payload["message"] = "none of this app's windows in the region is a real window (Finder's desktop "
+                + "draws nothing in a one-app capture), so the image would be blank"
+            return (payload, "applicationNotCapturable")
+        }
+
         let displays = EscalationLadder.displays()
         guard let display = EscalationLadder.display(holding: plan.region, among: displays) else {
             payload["message"] = EscalationLadder.CaptureFailure.regionOffScreen.description
@@ -2139,10 +2180,14 @@ final class HarnessServer {
 
         switch EscalationLadder.captureSynchronously(
             region: plan.region, on: display,
-            excludingBundleIdentifier: Bundle.main.bundleIdentifier
+            processIdentifier: application.processIdentifier
         ) {
         case .failure(let error):
             payload["message"] = String(describing: error)
+            if let failure = error as? EscalationLadder.CaptureFailure,
+               case .applicationNotListed = failure {
+                return (payload, "applicationNotCapturable")
+            }
             return (payload, "captureFailed")
 
         case .success(let outcome):
@@ -2186,8 +2231,11 @@ final class HarnessServer {
         request: HarnessRequest,
         rootNode: AccessibilityElementNode
     ) {
+        // The frontmost app — the same cached value `snapshotFocusedWindow`
+        // read moments ago in this request, so the app walked is the app shot.
         guard let plan = escalationPlan(
-            forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode
+            forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode,
+            application: NSWorkspace.shared.frontmostApplication
         ) else { return }
 
         let result = escalationPayload(plan: plan, capture: request.escalate)
@@ -2239,7 +2287,8 @@ final class HarnessServer {
         }
 
         guard let plan = escalationPlan(
-            forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode
+            forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode,
+            application: NSWorkspace.shared.frontmostApplication
         ) else {
             return fail(
                 "notFound",

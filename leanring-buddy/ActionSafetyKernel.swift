@@ -108,6 +108,7 @@ enum ActionSafetyKernel {
         reason == implausibleNameRefusalReason
             || reason.hasPrefix("refusing to type into a secure field")
             || reason.hasPrefix(secureFieldCaptureRefusalPrefix)
+            || reason.hasPrefix(incompleteCaptureCheckRefusalPrefix)
             || reason.hasPrefix(irreversibleRefusalPrefix)
     }
 
@@ -243,12 +244,30 @@ enum ActionSafetyKernel {
     ///
     /// Note what is NOT checked: the field's value. The kernel decides on the
     /// subrole alone and never reads the text it is protecting.
-    static func evaluateCapture(elementsInRegion: [AccessibilityElementNode]) -> SafetyDecision {
-        if elementsInRegion.contains(where: { $0.subrole == secureFieldSubrole }) {
+    ///
+    /// **An incomplete check is a refusal, not a pass.** An empty or partial
+    /// element list and a genuinely safe region both produce `.allow` — the
+    /// shape this project has been fooled by six times. So the input is not a
+    /// list of elements but a record of what was inspected: which windows, and
+    /// whether each walk finished. The capture that follows is restricted to
+    /// the same one application (`EscalationLadder.captureRegion`), so the
+    /// camera sees nothing this did not inspect.
+    static func evaluateCapture(_ inspection: CaptureInspection) -> SafetyDecision {
+        // First, and even inside a walk that then stopped: a secure field that
+        // was seen is refused as one, whatever else went unseen.
+        if inspection.windows.contains(where: { window in
+            window.nodes.contains(where: { $0.subrole == secureFieldSubrole })
+        }) {
             return .refuse(reason: "\(secureFieldCaptureRefusalPrefix) (subrole \(secureFieldSubrole))")
+        }
+        if let incomplete = inspection.incompleteReason {
+            return .refuse(reason: incomplete)
         }
         return .allow
     }
+
+    static let incompleteCaptureCheckRefusalPrefix =
+        "refusing to capture: the secure-field check could not inspect the whole region"
 
     static func evaluate(
         intent: ElementActionIntent,
@@ -408,5 +427,80 @@ enum ActionSafetyKernel {
         }
 
         return .allow
+    }
+}
+
+/// What the secure-field check actually inspected before a capture.
+///
+/// A value type on purpose, so the decision over it is testable without one
+/// AX read. Built by `EscalationLadder.inspectForCapture`.
+struct CaptureInspection {
+    /// One window of the target app whose frame touches the region.
+    struct WindowWalk {
+        /// App-written; only ever used to name the window in a refusal.
+        var title: UntrustedText? = nil
+        /// `AXWindow` for a real window. Finder's desktop is an `AXScrollArea`.
+        var role: String? = nil
+        /// Every node the walk returned — the whole window, not only the part
+        /// inside the region.
+        var nodes: [AccessibilityElementNode] = []
+        /// Which limits stopped the walk. Empty means it finished.
+        var stopReasons: Set<WalkStopReason> = []
+        /// Children reads that failed — each one a subtree nobody looked at.
+        var subtreesLostToFailedReads = 0
+        /// Why the walk never ran, when it threw.
+        var failure: String? = nil
+    }
+
+    /// The `AXError` raw value when `kAXWindows` could not be read; nil when it
+    /// was. A failed read is not "no windows" — it is "unknown windows".
+    var windowListReadError: Int32? = nil
+    var windows: [WindowWalk] = []
+
+    /// Whether a one-app capture of this region would show anything at all.
+    ///
+    /// Measured 2026-09-11: Finder with only its desktop "window" (an
+    /// `AXScrollArea`) produced an `ok: true` capture that was a **blank white
+    /// image with a cursor** — the one-app filter draws no desktop. Minutes
+    /// earlier the same situation failed, because ScreenCaptureKit did not list
+    /// Finder at all. Same screen, two answers, one of them a success that
+    /// describes nothing. Deciding it here, from structure, makes it one answer.
+    var containsDrawableWindow: Bool {
+        windows.contains { $0.role == kAXWindowRole as String }
+    }
+
+    /// Why this inspection does not cover the region, or nil when it does.
+    ///
+    /// No windows at all with a successful list read is complete, not a gap:
+    /// the capture is restricted to this one app, so a region none of its
+    /// windows touch contains none of its pixels either.
+    var incompleteReason: String? {
+        let prefix = ActionSafetyKernel.incompleteCaptureCheckRefusalPrefix
+        if let code = windowListReadError {
+            return "\(prefix) — kAXWindows failed with AXError \(code), so which windows cover it is unknown"
+        }
+        for (index, window) in windows.enumerated() {
+            var gaps: [String] = []
+            if let failure = window.failure { gaps.append("could not be walked (\(failure))") }
+            gaps += window.stopReasons.map(\.rawValue).sorted()
+            if window.subtreesLostToFailedReads > 0 {
+                gaps.append("lost \(window.subtreesLostToFailedReads) subtree(s) to failed children reads")
+            }
+            // Only a text field can be a password box, so a failed subrole read
+            // on a button changes nothing — scoping it here is what keeps this
+            // rule from refusing every capture of a busy app.
+            let unreadableTextFields = window.nodes.filter {
+                ActionSafetyKernel.typeableRoles.contains($0.role) && $0.subroleReadFailed
+            }.count
+            if unreadableTextFields > 0 {
+                gaps.append("has \(unreadableTextFields) text field(s) whose subrole could not be read, "
+                    + "any of which may be a password field")
+            }
+            guard !gaps.isEmpty else { continue }
+            // `forDisplay` already quotes; wrapping it again printed ""title"".
+            let name = window.title?.forDisplay ?? "#\(index) (untitled)"
+            return "\(prefix) — window \(name) \(gaps.joined(separator: ", "))"
+        }
+        return nil
     }
 }

@@ -106,6 +106,29 @@ enum EscalationLadder {
         return union.insetBy(dx: -candidatePaddingInPoints, dy: -candidatePaddingInPoints)
     }
 
+    /// Indices of the windows whose frames touch `region` — every window a
+    /// capture of that region could take pixels from.
+    ///
+    /// **Shared edges count as touching**, deliberately unlike
+    /// `CGRect.intersects`, which says two rects meeting only along an edge do
+    /// not intersect. The capture converts points to pixels at the backing
+    /// scale and rounds, so a window ending exactly where the region starts
+    /// can still put a row of pixels in the image. One walk too many costs a
+    /// walk; one too few is the hole this check exists to close.
+    ///
+    /// A zero-area frame is included as well: `liveWindows` reports a frame it
+    /// could not read as zero, and a window at an unknown position is not a
+    /// window known to be elsewhere.
+    static func windowIndices(intersecting region: CGRect, windowFrames: [CGRect]) -> [Int] {
+        windowFrames.indices.filter { index in
+            let frame = windowFrames[index]
+            guard frame.width > 0, frame.height > 0 else { return true }
+            let overlapsHorizontally = frame.minX <= region.maxX && frame.maxX >= region.minX
+            let overlapsVertically = frame.minY <= region.maxY && frame.maxY >= region.minY
+            return overlapsHorizontally && overlapsVertically
+        }
+    }
+
     // MARK: - Tier choice (pure)
 
     /// Which rung to take, and one sentence naming the condition that decided
@@ -306,6 +329,48 @@ enum EscalationLadder {
         )
     }
 
+    // MARK: - Inspection before capture
+
+    /// Walks every window of `application` that touches `region` — the input
+    /// to `ActionSafetyKernel.evaluateCapture`, taken before the shutter.
+    ///
+    /// Fresh walks, including of the window the caller already walked to plan
+    /// the region: that walk covered one window where the capture shows all of
+    /// the app's, and may itself have been truncated. Called only when a
+    /// capture is actually about to happen, never for the free announcement.
+    ///
+    /// ponytail: serial, and it re-walks the planning window. An app with
+    /// several large windows (Mail) pays several walks inside one request;
+    /// reuse the planning walk if `inspectMilliseconds` shows it matters.
+    static func inspectForCapture(region: CGRect, of application: NSRunningApplication) -> CaptureInspection {
+        let read = AccessibilityWindows.liveWindows(for: application)
+        guard read.readSucceeded else {
+            return CaptureInspection(windowListReadError: read.error.rawValue)
+        }
+        let indices = windowIndices(
+            intersecting: region,
+            windowFrames: read.windows.map(\.candidate.frameInAppKitCoordinates)
+        )
+        return CaptureInspection(windows: indices.map { index -> CaptureInspection.WindowWalk in
+            let window = read.windows[index]
+            do {
+                let snapshot = try AccessibilityTreeWalker.snapshotWindow(window.element, of: application)
+                return CaptureInspection.WindowWalk(
+                    title: window.candidate.title,
+                    role: window.candidate.role,
+                    nodes: snapshot.rootNode?.flattenedDescendants() ?? [],
+                    stopReasons: snapshot.walkStopReasons,
+                    subtreesLostToFailedReads: snapshot.subtreesLostToFailedReads
+                )
+            } catch {
+                return CaptureInspection.WindowWalk(
+                    title: window.candidate.title, role: window.candidate.role,
+                    failure: String(describing: error)
+                )
+            }
+        })
+    }
+
     // MARK: - Capture
 
     struct CaptureOutcome {
@@ -323,9 +388,17 @@ enum EscalationLadder {
         case captureFailed(String)
         case encodingFailed
         case timedOut
+        case applicationNotListed(pid_t)
+        case ownApplication
 
         var description: String {
             switch self {
+            case .applicationNotListed(let processIdentifier):
+                return "ScreenCaptureKit lists no application with process ID \(processIdentifier), and a "
+                    + "display-wide capture is never the fallback — it would photograph windows the "
+                    + "secure-field check did not inspect"
+            case .ownApplication:
+                return "the target application is Clicky itself, and the agent never photographs its own overlay"
             case .noDisplay: return "no display is available to capture"
             case .regionOffScreen: return "the region does not intersect any display"
             case .captureFailed(let detail): return "ScreenCaptureKit failed: \(detail)"
@@ -335,17 +408,30 @@ enum EscalationLadder {
         }
     }
 
-    /// One region, one display, cropped by the capture itself.
+    /// One region, one display, **one application**, cropped by the capture
+    /// itself.
     ///
-    /// Our own windows are excluded exactly as the companion path excludes
-    /// them: the agent must never photograph its own overlay and then reason
-    /// about what it drew.
+    /// Only the target app's windows are in the image. The display-wide filter
+    /// this replaced photographed every app inside the rectangle while the
+    /// secure-field check had walked one app's tree, so a password manager
+    /// floating over the region was captured and never inspected. The filter
+    /// now includes exactly the app `inspectForCapture` walked: other apps, the
+    /// wallpaper and our own overlay are simply not in the picture. There is no
+    /// fallback to the display — an app ScreenCaptureKit does not list fails
+    /// the capture.
     static func captureRegion(
         _ region: CGRect,
         on display: DisplayInfo,
-        excludingBundleIdentifier: String?
+        processIdentifier: pid_t
     ) async throws -> CaptureOutcome {
         let startedAt = Date()
+
+        // The agent must never photograph its own overlay and then reason about
+        // what it drew. Including only the target app guarantees that unless
+        // the target IS us.
+        guard processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            throw CaptureFailure.ownApplication
+        }
 
         let content: SCShareableContent
         do {
@@ -365,10 +451,16 @@ enum EscalationLadder {
             throw CaptureFailure.regionOffScreen
         }
 
-        let ownWindows = content.windows.filter {
-            $0.owningApplication?.bundleIdentifier == excludingBundleIdentifier
+        // By process ID, never bundle identifier: two instances of one app share
+        // a bundle ID, and only one of them had its windows walked.
+        guard let targetApplication = content.applications.first(where: {
+            $0.processID == processIdentifier
+        }) else {
+            throw CaptureFailure.applicationNotListed(processIdentifier)
         }
-        let filter = SCContentFilter(display: scDisplay, excludingWindows: ownWindows)
+        let filter = SCContentFilter(
+            display: scDisplay, including: [targetApplication], exceptingWindows: []
+        )
 
         let configuration = SCStreamConfiguration()
         // The crop, done by the capture. `sourceRect` is CG display-relative;
@@ -430,7 +522,7 @@ enum EscalationLadder {
     static func captureSynchronously(
         region: CGRect,
         on display: DisplayInfo,
-        excludingBundleIdentifier: String?
+        processIdentifier: pid_t
     ) -> Result<CaptureOutcome, Error> {
         let box = OutcomeBox()
         let semaphore = DispatchSemaphore(value: 0)
@@ -438,7 +530,7 @@ enum EscalationLadder {
         Task.detached {
             do {
                 box.result = .success(try await captureRegion(
-                    region, on: display, excludingBundleIdentifier: excludingBundleIdentifier
+                    region, on: display, processIdentifier: processIdentifier
                 ))
             } catch {
                 box.result = .failure(error)

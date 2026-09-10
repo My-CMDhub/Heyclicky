@@ -47,5 +47,19 @@ raise SystemExit(0 if d['result'] == 'Passed' else 1)
 " && exit 0 || { [[ $? -eq 1 ]] && exit 1; }
 done
 
-echo "timed out waiting for a new .xcresult" >&2
+# The loop ran out. Say why, because each known cause looks exactly like a hang.
+#
+# Measured 2026-09-11: the Mac locked mid-run. Xcode ran all 97 tests (its own
+# log: "Test run with 97 tests passed") and then never finalised the bundle —
+# it sat in Staging/, unreadable by xcresulttool — so this script reported
+# "timed out" about a run that had passed. Still exit 1: a log line is not a
+# result bundle, and a run we could not read is not a clean pass.
+echo "timed out waiting for a finished .xcresult" >&2
+if ioreg -n Root -d1 | grep -q '"CGSSessionScreenIsLocked"=Yes'; then
+  echo "  the screen is LOCKED — Xcode can run tests but stalls writing the result bundle; unlock and re-run" >&2
+fi
+if [[ -n "$bundleNow" && "$bundleNow" != "$bundleBefore" && -d "$bundleNow/Staging" ]]; then
+  staged=$(find "$bundleNow/Staging" -name 'Session-*.log' -exec grep -h 'Test run with' {} + 2>/dev/null | tail -1)
+  [[ -n "$staged" ]] && echo "  the unfinalised bundle's own log says: ${staged##*console chunk }" >&2
+fi
 exit 1

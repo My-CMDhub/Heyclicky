@@ -52,6 +52,17 @@ struct AccessibilityElementNode {
             && frameInAppKitCoordinates.height > 0
     }
 
+    /// True when the subrole could not be read — as opposed to the element
+    /// genuinely having none.
+    ///
+    /// The subrole is the only thing that tells a password box
+    /// (`AXSecureTextField`) apart from any other text box. A timed-out read
+    /// used to arrive as nil, which reads as "not a password box", and the
+    /// capture check waved it through. Third instance of the rule that a read
+    /// failure must never be returned as absence (`copyChildElements`,
+    /// `liveWindows`) — this time inside a security check.
+    let subroleReadFailed: Bool
+
     /// The live cross-process handle. Present only on nodes produced by a real
     /// walk — hand-built nodes in tests leave it nil.
     let accessibilityElement: AXUIElement?
@@ -66,6 +77,7 @@ struct AccessibilityElementNode {
         depth: Int,
         children: [AccessibilityElementNode],
         publishedActionNames: [String] = [],
+        subroleReadFailed: Bool = false,
         accessibilityElement: AXUIElement? = nil
     ) {
         self.role = role
@@ -79,6 +91,7 @@ struct AccessibilityElementNode {
         self.depth = depth
         self.children = children
         self.publishedActionNames = publishedActionNames
+        self.subroleReadFailed = subroleReadFailed
         self.accessibilityElement = accessibilityElement
     }
 }
@@ -452,9 +465,42 @@ enum AccessibilityTreeWalker {
             throw AccessibilitySnapshotError.noFocusedWindow
         }
 
+        return try snapshotWindow(
+            focusedWindowElement,
+            of: frontmostApplication,
+            maximumDepth: maximumDepth,
+            maximumNodeCount: maximumNodeCount
+        )
+    }
+
+    /// Walks one window of one application — focused or not.
+    ///
+    /// The only walk implementation. `snapshotFocusedWindow` finds its window
+    /// and calls this; the escalation ladder calls it for every window of the
+    /// app a capture is about to photograph. Same budget, same deduplication,
+    /// same lock-screen refusal — so the secure-field check before a capture
+    /// cannot be reading a different tree from the one every other verb reads.
+    static func snapshotWindow(
+        _ windowElement: AXUIElement,
+        of application: NSRunningApplication,
+        maximumDepth: Int = 120,
+        maximumNodeCount: Int = 25_000
+    ) throws -> AccessibilityWindowSnapshot {
+        guard AXIsProcessTrusted() else {
+            throw AccessibilitySnapshotError.accessibilityPermissionNotGranted
+        }
+        guard !LockScreenGuard.isLockScreen(application.bundleIdentifier) else {
+            throw AccessibilitySnapshotError.screenIsLocked
+        }
+        // System-wide, for the reason given in `snapshotFocusedWindow`: every
+        // child this walk creates is a fresh object a per-element timeout
+        // would not cover.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)
+
         // NSScreen.screens[0] is always the display whose origin is (0, 0) —
         // the one AX measures every other display relative to.
         let primaryDisplayHeightInPoints = NSScreen.screens.first?.frame.height ?? 0
+        let frontmostAtStart = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         var budget = AccessibilityWalkBudget(
             maximumDepth: maximumDepth,
@@ -470,7 +516,7 @@ enum AccessibilityTreeWalker {
         var childrenElidedByVisibleSubset = 0
         var duplicateElementsSkipped = 0
         var visitedElements: Set<AccessibilityElementKey> = [
-            AccessibilityElementKey(element: focusedWindowElement)
+            AccessibilityElementKey(element: windowElement)
         ]
 
         // How far off-screen still counts as reachable.
@@ -483,7 +529,7 @@ enum AccessibilityTreeWalker {
         // One window-height of margin on every side keeps anything a scroll or
         // two away inside the tree by construction rather than by luck.
         var windowFrameValue: CFTypeRef?
-        AXUIElementCopyAttributeValue(focusedWindowElement, "AXFrame" as CFString, &windowFrameValue)
+        AXUIElementCopyAttributeValue(windowElement, "AXFrame" as CFString, &windowFrameValue)
         var windowRect = CGRect.zero
         if let windowFrameValue, CFGetTypeID(windowFrameValue) == AXValueGetTypeID() {
             AXValueGetValue(windowFrameValue as! AXValue, .cgRect, &windowRect)
@@ -496,7 +542,7 @@ enum AccessibilityTreeWalker {
 
         let walkStartedAt = Date()
         let rootNode = buildNode(
-            from: focusedWindowElement,
+            from: windowElement,
             depth: 0,
             primaryDisplayHeightInPoints: primaryDisplayHeightInPoints,
             budget: &budget,
@@ -516,14 +562,15 @@ enum AccessibilityTreeWalker {
 
         // The tree is a live system, not a frozen image. On a slow app the walk
         // outlives the user's attention, so we check whether the ground moved.
+        // Compared against the frontmost app at the START of the walk rather
+        // than the walked app, which for a background window is never in front.
         let focusChangedDuringWalk =
-            NSWorkspace.shared.frontmostApplication?.processIdentifier
-                != frontmostApplication.processIdentifier
+            NSWorkspace.shared.frontmostApplication?.processIdentifier != frontmostAtStart
 
         return AccessibilityWindowSnapshot(
             rootNode: rootNode,
-            applicationName: frontmostApplication.localizedName ?? "unknown",
-            bundleIdentifier: frontmostApplication.bundleIdentifier ?? "unknown",
+            applicationName: application.localizedName ?? "unknown",
+            bundleIdentifier: application.bundleIdentifier ?? "unknown",
             walkDurationInSeconds: walkDurationInSeconds,
             nodeCount: budget.nodesVisited,
             deepestLevelReached: deepestLevelReached,
@@ -661,7 +708,23 @@ enum AccessibilityTreeWalker {
         let role = batched?.role
             ?? copyStringAttribute(from: element, attribute: kAXRoleAttribute)
             ?? "AXUnknown"
-        let subrole = batched?.subrole ?? copyStringAttribute(from: element, attribute: kAXSubroleAttribute)
+        // Not `copyStringAttribute`, which returns nil for every error: a subrole
+        // that could not be read must stay distinguishable from no subrole,
+        // because that is exactly how a password box would slip past the capture
+        // check. Same cost as before — this read already ran for every nil.
+        var subrole = batched?.subrole
+        var subroleReadFailed = false
+        if subrole == nil {
+            var rawSubrole: AnyObject?
+            let subroleError = AXUIElementCopyAttributeValue(
+                element, kAXSubroleAttribute as CFString, &rawSubrole
+            )
+            if subroleError == .success {
+                subrole = (rawSubrole as? String).flatMap { $0.isEmpty ? nil : $0 }
+            } else {
+                subroleReadFailed = !(subroleError == .noValue || subroleError == .attributeUnsupported)
+            }
+        }
         let title = batched?.title ?? copyStringAttribute(from: element, attribute: kAXTitleAttribute)
         let value = batched?.value ?? copyStringAttribute(from: element, attribute: kAXValueAttribute)
         let elementDescription = batched?.elementDescription
@@ -777,6 +840,7 @@ enum AccessibilityTreeWalker {
             depth: depth,
             children: childNodes,
             publishedActionNames: publishedActionNames,
+            subroleReadFailed: subroleReadFailed,
             accessibilityElement: element
         )
     }
