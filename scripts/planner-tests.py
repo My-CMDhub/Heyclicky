@@ -148,28 +148,28 @@ def settings_running():
 
 
 def open_settings_fresh(run, deadline_seconds=8.0):
-    """Quit System Settings, wait until it is really gone, open it, wait until it answers.
+    """Quit System Settings, wait until it is really gone, then `launch` it over the socket.
 
     Measured 2026-09-11: opening it straight after the previous task's quit
     raced the quit — LaunchServices failed with -600 and the next `focus`
     reported notFound. A fixed sleep is the same bug with a longer fuse, so
-    both edges are polled against a deadline.
+    the quit edge is polled against a deadline, and `launch` waits on the
+    other edge itself: the app's own AXFrontmost plus a readable window.
+
+    The launch goes through the harness so it is audited and kernel-checked
+    like every other step. The quit stays outside: there is no quit verb.
     """
     subprocess.run(["osascript", "-e", 'quit app "System Settings"'])
     until = time.time() + deadline_seconds
     while settings_running() and time.time() < until:
         time.sleep(0.2)
-    subprocess.run(["open", "-b", "com.apple.systempreferences"])
-    until = time.time() + deadline_seconds
-    while time.time() < until:
-        if run.call({"verb": "focus", "app": "System Settings"}, note="wait for launch").get("ok"):
-            # Same as Run.focus: the app just pinned is the one every later
-            # app-scoped request must name, or the frontmost guard never runs.
-            run.app = "System Settings"
-            time.sleep(1.0)
-            return True
-        time.sleep(0.4)
-    return False
+    if run.call({"verb": "launch", "app": "System Settings"}, note="launch and wait").get("status") != "ready":
+        return False
+    # Same as Run.focus: the app just launched is the one every later
+    # app-scoped request must name, or the frontmost guard never runs.
+    run.app = "System Settings"
+    time.sleep(1.0)
+    return True
 
 
 def close_settings():
