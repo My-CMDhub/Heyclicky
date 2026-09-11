@@ -104,9 +104,15 @@ class Run:
         # Focus drifts between requests on this machine (measured 2026-09-11),
         # so every step that depends on the front app pins it first — and the
         # app becomes the expectApp every later app-scoped request carries.
+        #
+        # No sleep after the pin. Measured 2026-09-12: a confirmed focus held
+        # for 2 s in 30 of 30 unattended trials (Finder, System Settings, and
+        # across a menu press), and the one flip seen in three planner runs came
+        # 1.6 s after confirmation — outside any wait this loop could afford.
+        # The blind 0.8 s here cost 7 s a run (31.3 s -> 23.8 / 24.5 s) and
+        # caught nothing; expectApp plus the one bounded recovery is the guard.
         self.app = app
         self.call({"verb": "focus", "app": app}, note="pin focus")
-        time.sleep(0.8)
 
     def names(self):
         snapshot = self.call({"verb": "snapshot"}, note="checker read")
