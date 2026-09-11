@@ -2307,3 +2307,87 @@ private func expectEverySuggestionResolvesToItsOwnCandidate(
     #expect(ActionVerifier.outcome(afterPolls: twoGaps, elapsedMilliseconds: 300, hadFocusedWindowBefore: true)
         == .windowGone(afterMilliseconds: 300))
 }
+
+// MARK: - launch
+
+@Test func launchNeedsAnAppAndRefusesAPath() async throws {
+    guard case .failure(let missing) = HarnessPolicy.decode(line: #"{"id":"l1","verb":"launch"}"#),
+          case .failure(let path) = HarnessPolicy.decode(
+            line: #"{"id":"l2","verb":"launch","app":"/Applications/Calculator.app"}"#
+          ),
+          case .success(let plain) = HarnessPolicy.decode(line: #"{"id":"l3","verb":"launch","app":"Calculator"}"#)
+    else {
+        Issue.record("expected two refusals and one decoded request")
+        return
+    }
+    #expect(missing == .missingField("app"))
+    // A path could name a script or an installer — refused, never resolved.
+    #expect(path == .invalidField(field: "app", value: "/Applications/Calculator.app"))
+    #expect(plain.app == "Calculator")
+    #expect(HarnessVerb.launch.isMutating)
+    #expect(HarnessVerb.launch.elementAction == nil)
+}
+
+@Test func launchNameResolutionIsExactCaseInsensitiveAndNeverAPrefix() async throws {
+    let applications = URL(fileURLWithPath: "/fake/Applications", isDirectory: true)
+    let system = URL(fileURLWithPath: "/fake/System/Applications", isDirectory: true)
+    let listing: (URL) -> [String] = { directory in
+        directory == system
+            ? ["Calculator.app", "Calendar.app", "Utilities", "Xcode.app"]
+            : ["Calculator Pro.app", "Cursor.app", "Xcode.app"]
+    }
+    let directories = [applications, system]
+    func paths(_ name: String) -> [String] {
+        ApplicationLauncher.matchApplications(named: name, in: directories, listing: listing).map(\.path)
+    }
+
+    #expect(paths("calculator") == ["/fake/System/Applications/Calculator.app"])
+    // A prefix is a guess about which app to start.
+    #expect(paths("Calc").isEmpty)
+    #expect(paths("Photoshop").isEmpty)
+    // The same name in two folders is two apps, never first-wins.
+    #expect(paths("Xcode").count == 2)
+}
+
+@Test func launchAsksBeforeATerminalAndAllowsACalculator() async throws {
+    guard case .requireConfirmation(let reason) = ActionSafetyKernel.evaluateLaunch(bundleIdentifier: "com.apple.Terminal") else {
+        Issue.record("expected Terminal to require confirmation")
+        return
+    }
+    #expect(reason.contains("com.apple.Terminal"))
+    // LaunchServices ignores case, so the kernel must too.
+    #expect(ActionSafetyKernel.evaluateLaunch(bundleIdentifier: "COM.APPLE.TERMINAL") != .allow)
+    #expect(ActionSafetyKernel.evaluateLaunch(bundleIdentifier: "com.apple.calculator") == .allow)
+}
+
+@Test func aLaunchingAppThatDoesNotAnswerIsNotYetNeverNo() async throws {
+    // Measured 2026-09-11: a launching app answers AXFrontmost with -25204 before `true`.
+    let notAnswering = ApplicationLauncher.ReadinessSample(frontmost: nil, frontmostError: -25204, window: false)
+    #expect(ApplicationLauncher.isFrontmost(notAnswering) == false)
+    #expect(ApplicationLauncher.status(frontmostSeen: false, windowSeen: false, deadlinePassed: false) == nil)
+
+    let ready = ApplicationLauncher.ReadinessSample(frontmost: true, frontmostError: nil, window: true)
+    #expect(ApplicationLauncher.isFrontmost(ready))
+    #expect(ApplicationLauncher.status(frontmostSeen: true, windowSeen: true, deadlinePassed: false) == .ready)
+
+    // Forward with no window keeps waiting, then says so — some apps are windowless.
+    #expect(ApplicationLauncher.status(frontmostSeen: true, windowSeen: false, deadlinePassed: false) == nil)
+    #expect(ApplicationLauncher.status(frontmostSeen: true, windowSeen: false, deadlinePassed: true) == .frontmostNoWindow)
+
+    // Never forward is not ready, even with a window: it launched behind something.
+    #expect(ApplicationLauncher.status(frontmostSeen: false, windowSeen: true, deadlinePassed: true) == .notReady)
+}
+
+
+@Test func aRunningAppOutsideTheSearchedFoldersResolvesByExactName() async throws {
+    // Finder is in /System/Library/CoreServices, which name resolution does not
+    // search — measured notFound on 2026-09-11. A running app matches by name.
+    let finder = URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app")
+    let running: [(name: String?, bundleURL: URL?)] = [
+        ("Finder", finder),
+        ("Calculator", URL(fileURLWithPath: "/System/Applications/Calculator.app")),
+        (nil, nil)
+    ]
+    #expect(ApplicationLauncher.runningMatches(named: "finder", among: running) == [finder])
+    #expect(ApplicationLauncher.runningMatches(named: "Find", among: running).isEmpty)
+}

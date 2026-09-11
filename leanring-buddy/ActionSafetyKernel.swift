@@ -228,6 +228,32 @@ enum ActionSafetyKernel {
         return .allow
     }
 
+    /// Apps that run arbitrary code or hold credentials. Starting one is asked about.
+    static let launchConfirmationBundleIdentifiers: Set<String> = [
+        "com.apple.Terminal", "com.googlecode.iterm2", "com.apple.ScriptEditor2",
+        "com.apple.Automator", "com.apple.shortcuts", "com.apple.installer",
+        "com.apple.keychainaccess", "com.apple.Passwords"
+    ]
+
+    /// Launch: deliberately narrower than `AXOpen`, and so allowed where opening
+    /// always asks. Its target is an installed application by identity — the
+    /// harness resolves a bundle identifier or an exact name in the application
+    /// folders and refuses any path — never a file, so it cannot run a script or
+    /// a downloaded installer. The full per-app policy is plan item 5, not this verb.
+    ///
+    /// Bundle identifiers are case-insensitive to LaunchServices, so the match is
+    /// too — otherwise "COM.APPLE.TERMINAL" would be a way past the question.
+    static func evaluateLaunch(bundleIdentifier: String) -> SafetyDecision {
+        if launchConfirmationBundleIdentifiers.contains(where: {
+            $0.caseInsensitiveCompare(bundleIdentifier) == .orderedSame
+        }) {
+            return .requireConfirmation(
+                reason: "launching \(bundleIdentifier) — it runs arbitrary code or holds credentials"
+            )
+        }
+        return .allow
+    }
+
     static let secureFieldCaptureRefusalPrefix = "refusing to capture a region containing a secure field"
 
     /// Whether a region may be photographed.

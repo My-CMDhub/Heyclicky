@@ -96,13 +96,17 @@ enum HarnessVerb: String, CaseIterable {
     /// nothing — so it survives the kill switch, exactly like `snapshot`.
     case look
 
+    /// Start (or activate) an installed application by bundle identifier or
+    /// exact name, and wait until it says it is in front.
+    case launch
+
     /// Whether this verb can change the world. The kill switch stops these and
     /// leaves the read-only pair working, so an operator who tripped it can
     /// still look at the machine and find out why.
     var isMutating: Bool {
         switch self {
         case .ping, .snapshot, .menus, .windows, .look: return false
-        case .press, .select, .type, .open, .menu, .focus: return true
+        case .press, .select, .type, .open, .menu, .focus, .launch: return true
         }
     }
 
@@ -123,7 +127,8 @@ enum HarnessVerb: String, CaseIterable {
         //
         // `look` is nil for a third reason: it does not act at all. It resolves
         // a name only to find out how many things carry it.
-        case .ping, .snapshot, .menu, .menus, .windows, .focus, .look: return nil
+        // `launch` targets an application, not an element: `evaluateLaunch`.
+        case .ping, .snapshot, .menu, .menus, .windows, .focus, .look, .launch: return nil
         }
     }
 }
@@ -256,6 +261,14 @@ enum HarnessPolicy {
         // Neither is not a default — it is a request to focus nothing.
         if verb == .focus, (raw.app ?? "").isEmpty, (raw.title ?? "").isEmpty {
             return .failure(.missingField("app"))
+        }
+
+        // `launch` names an installed application and nothing else. A path could
+        // name a script or an installer — exactly what `AXOpen`'s "opening always
+        // asks" rule exists for — so a slash is refused, not resolved.
+        if verb == .launch {
+            guard let app = raw.app, !app.isEmpty else { return .failure(.missingField("app")) }
+            guard !app.contains("/") else { return .failure(.invalidField(field: "app", value: app)) }
         }
 
         // A forced rung, validated the same way `mode` and `target` are: a
@@ -1011,6 +1024,9 @@ final class HarnessServer {
 
         case .look:
             return lookResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .launch:
+            return launchResponse(request, dryRun: dryRun, startedAt: startedAt)
         }
     }
 
@@ -2044,6 +2060,114 @@ final class HarnessServer {
         audit(request, dryRun: dryRun, kernel: described.decision,
               outcome: outcome.observed ? "confirmed" : "notObserved", startedAt: startedAt)
         return response
+    }
+
+    // MARK: launch
+
+    // Timing is `launchMilliseconds` and never `walkMilliseconds` — for the
+    // reason spelled out above `// MARK: menu / menus`. A launch is seconds of
+    // waiting, and in the slow-walk median it would be a poisoned sample.
+
+    private func launchResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        var response: [String: Any] = [
+            "dryRun": dryRun, "confirmed": request.confirmed,
+            "app": (request.app ?? NSNull()) as Any
+        ]
+        func fail(_ code: String, _ message: String, kernel: String = "n/a") -> [String: Any] {
+            response["ok"] = false
+            response["error"] = code
+            response["message"] = message
+            audit(request, dryRun: dryRun, kernel: kernel, outcome: code, startedAt: startedAt)
+            return response
+        }
+
+        // `decode` guarantees it; a nil here is our bug, not a default.
+        guard let query = request.app else { return fail("missingField", "missing required field \"app\"") }
+
+        // `open -a` cannot launch into a locked session, and a launch that
+        // "succeeds" behind the lock screen is a believable, wrong answer.
+        guard !LockScreenGuard.isLockScreen(Self.frontmostBundleIdentifier()) else {
+            return fail("screenIsLocked", "the screen is locked — an application cannot be launched into it")
+        }
+
+        let url: URL
+        let bundleIdentifier: String
+        switch ApplicationLauncher.resolve(query) {
+        case .resolved(let resolvedURL, let resolvedIdentifier):
+            url = resolvedURL
+            bundleIdentifier = resolvedIdentifier
+        case .notFound:
+            return fail("notFound", "no installed application matches \(UntrustedText(query).forDisplay) "
+                + "by bundle identifier or exact name in "
+                + ApplicationLauncher.searchDirectories.map(\.path).joined(separator: ", "))
+        case .ambiguous(let candidates):
+            response["candidates"] = candidates.map(\.path)
+            return fail("ambiguous", "\(candidates.count) installed applications match \(UntrustedText(query).forDisplay)")
+        }
+        response["application"] = url.deletingPathExtension().lastPathComponent
+        response["bundleIdentifier"] = bundleIdentifier
+        response["path"] = url.path
+
+        let decision = ActionSafetyKernel.evaluateLaunch(bundleIdentifier: bundleIdentifier)
+        let described = HarnessPolicy.describe(decision)
+        let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
+        response["kernel"] = [
+            "decision": described.decision,
+            "reason": (described.reason ?? NSNull()) as Any,
+            "executable": executability.executable,
+            "note": (executability.reason ?? NSNull()) as Any
+        ]
+        guard executability.executable else {
+            let code = described.decision == "refuse" ? "kernelRefused" : "confirmationRequired"
+            return fail(code, executability.reason ?? code, kernel: described.decision)
+        }
+
+        // Read BEFORE launching. Inside a request NSWorkspace's caches are frozen
+        // (we are inside `DispatchQueue.main.sync`), but this one was refreshed by
+        // the run loop before the request arrived — and it is not read again.
+        response["alreadyRunning"] = !NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty
+
+        guard !dryRun else {
+            response["ok"] = true
+            response["performed"] = ["status": "skipped", "reason": "dry run — nothing was launched"]
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "dryRun", startedAt: startedAt)
+            return response
+        }
+
+        let outcome = ApplicationLauncher.launchAndWait(url)
+        response["launchMilliseconds"] = elapsedMilliseconds(since: startedAt)
+        response["launch"] = [
+            "processMilliseconds": (outcome.processMilliseconds ?? NSNull()) as Any,
+            "frontmostMilliseconds": (outcome.frontmostMilliseconds ?? NSNull()) as Any,
+            "windowMilliseconds": (outcome.windowMilliseconds ?? NSNull()) as Any,
+            // Raw AXError values. -25204 is "still launching", not "refused" —
+            // the clock beside it is what separates the two.
+            "lastFrontmostError": (outcome.lastFrontmostError.map { Int($0) } ?? NSNull()) as Any,
+            "lastWindowError": (outcome.lastWindowError.map { Int($0) } ?? NSNull()) as Any
+        ]
+
+        if let launchError = outcome.launchError {
+            return fail("launchFailed", launchError, kernel: described.decision)
+        }
+
+        response["status"] = outcome.status.rawValue
+        switch outcome.status {
+        case .ready, .frontmostNoWindow:
+            response["ok"] = true
+            audit(request, dryRun: dryRun, kernel: described.decision,
+                  outcome: outcome.status.rawValue, startedAt: startedAt)
+            return response
+        case .notReady:
+            // Deliberately not an ordinary refusal: it reaches the flight recorder.
+            return fail(
+                "launchNotReady",
+                "\(bundleIdentifier) never reported AXFrontmost true within "
+                    + "\(ApplicationLauncher.launchReadinessDeadlineInSeconds) s"
+                    + (outcome.windowMilliseconds != nil ? " — it has a window, so it may have launched behind another app" : ""),
+                kernel: described.decision
+            )
+        }
     }
 
     // MARK: look / escalation
