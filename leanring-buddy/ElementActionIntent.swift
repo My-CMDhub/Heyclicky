@@ -211,6 +211,50 @@ enum ElementActionIntentResolver {
         }
     }
 
+    /// One match, with the container name that picks it out alone — or nil.
+    struct ContainerSuggestion {
+        let node: AccessibilityElementNode
+        /// Nil when no named ancestor separates this match from every other.
+        /// Never a fallback: nil is what stops a caller re-issuing a name that
+        /// would only come back ambiguous.
+        let suggestedWithinNamed: String?
+    }
+
+    /// For each match `resolve` counts, the nearest named ancestor that no other
+    /// match sits inside.
+    ///
+    /// Same `collectMatches` set and the same exact-name `contains` test the
+    /// `withinNamed` narrowing uses, because a disambiguator computed against a
+    /// different candidate set than the verb that consumes it came straight back
+    /// ambiguous (measured 2026-09-10). Re-issuing the intent with `withinNamed`
+    /// set to a suggestion narrows to exactly one match, so the `nearPoint` step
+    /// after it never runs and the intent's point needs no clearing; any
+    /// `withinNamed` already on the intent is ignored, since the suggestion
+    /// replaces it.
+    static func containerSuggestions(
+        for intent: ElementActionIntent,
+        inTreeRootedAt rootNode: AccessibilityElementNode
+    ) -> [ContainerSuggestion] {
+        var matches: [(node: AccessibilityElementNode, ancestorNames: [String])] = []
+        collectMatches(in: rootNode, ancestorNames: [], for: intent, into: &matches)
+
+        // How many matches sit inside each name — once per match, because a name
+        // repeated along one chain is still one `contains` hit.
+        var matchesInside: [String: Int] = [:]
+        for match in matches {
+            for name in Set(match.ancestorNames) { matchesInside[name, default: 0] += 1 }
+        }
+
+        return matches.map { match in
+            let separating = match.ancestorNames.reversed().first { name in
+                // App-written text that will come back to us as a match key, so
+                // an implausible one is skipped and the walk continues upward.
+                matchesInside[name] == 1 && UntrustedText(name).isPlausibleControlLabel
+            }
+            return ContainerSuggestion(node: match.node, suggestedWithinNamed: separating)
+        }
+    }
+
     /// Every match, carrying the names of the containers it sits inside.
     ///
     /// Walks with the ancestor chain in hand rather than flattening first — the

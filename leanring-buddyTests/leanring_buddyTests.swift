@@ -2093,3 +2093,126 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
     window.role = "AXWindow"
     #expect(CaptureInspection(windows: [desktop, window]).containsDrawableWindow)
 }
+
+// MARK: - Container suggestions: the free rung above the picture
+
+private func namedContainer(_ name: String, _ children: [AccessibilityElementNode]) -> AccessibilityElementNode {
+    AccessibilityElementNode(
+        role: "AXGroup", subrole: nil, title: name, value: nil,
+        frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 800, height: 600),
+        depth: 1, children: children
+    )
+}
+
+/// The property, asserted by consuming it: a suggestion is only worth sending if
+/// the resolver that receives it resolves to that candidate and no other.
+private func expectEverySuggestionResolvesToItsOwnCandidate(
+    _ suggestions: [ElementActionIntentResolver.ContainerSuggestion],
+    intent: ElementActionIntent,
+    root: AccessibilityElementNode
+) {
+    for suggestion in suggestions {
+        guard let name = suggestion.suggestedWithinNamed else { continue }
+        var narrowed = intent
+        narrowed.withinNamed = name
+        #expect(ElementActionIntentResolver.resolve(narrowed, inTreeRootedAt: root) == .resolved(suggestion.node))
+    }
+}
+
+@Test func eachAmbiguousCandidateIsOfferedTheContainerThatPicksItOut() async throws {
+    let window = windowContaining([
+        namedContainer("Toolbar", [pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40))]),
+        namedContainer("Sidebar", [pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))])
+    ])
+    let intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+    #expect(ElementActionIntentResolver.resolve(intent, inTreeRootedAt: window) == .ambiguous(matchCount: 2))
+
+    let suggestions = ElementActionIntentResolver.containerSuggestions(for: intent, inTreeRootedAt: window)
+    #expect(suggestions.map(\.suggestedWithinNamed) == ["Toolbar", "Sidebar"])
+    expectEverySuggestionResolvesToItsOwnCandidate(suggestions, intent: intent, root: window)
+}
+
+@Test func theNearestSeparatingContainerWinsOverASharedOrFartherOne() async throws {
+    // "Window" holds both, so it separates nothing. "Left"/"Right" separate but
+    // sit farther up than "Toolbar"/"Sidebar", which is what a human would say.
+    let window = windowContaining([
+        namedContainer("Window", [
+            namedContainer("Left", [namedContainer("Toolbar", [
+                pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40))
+            ])]),
+            namedContainer("Right", [namedContainer("Sidebar", [
+                pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))
+            ])])
+        ])
+    ])
+    let intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+
+    let suggestions = ElementActionIntentResolver.containerSuggestions(for: intent, inTreeRootedAt: window)
+    #expect(suggestions.map(\.suggestedWithinNamed) == ["Toolbar", "Sidebar"])
+    expectEverySuggestionResolvesToItsOwnCandidate(suggestions, intent: intent, root: window)
+}
+
+@Test func siblingsInOneContainerAreOfferedNoContainerAtAll() async throws {
+    // Chrome's 18 same-container groups. Nil, never "Toolbar": that name would
+    // come straight back ambiguous.
+    let window = windowContaining([
+        namedContainer("Toolbar", [
+            pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40)),
+            pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))
+        ])
+    ])
+    let intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+
+    let suggestions = ElementActionIntentResolver.containerSuggestions(for: intent, inTreeRootedAt: window)
+    #expect(suggestions.count == 2)
+    #expect(suggestions.map(\.suggestedWithinNamed) == [nil, nil])
+}
+
+@Test func anImplausibleContainerNameIsSkippedForTheNextOneUp() async throws {
+    // Unique, and nearest, and a newline in it — app-written text that would
+    // come back to us as a match key.
+    let window = windowContaining([
+        namedContainer("Toolbar", [namedContainer("Nav\nforged", [
+            pressableNodeTitled("Back", at: CGRect(x: 0, y: 550, width: 40, height: 40))
+        ])]),
+        namedContainer("Sidebar", [pressableNodeTitled("Back", at: CGRect(x: 300, y: 200, width: 60, height: 30))])
+    ])
+    let intent = ElementActionIntent(role: "AXButton", title: "Back", action: .press)
+
+    let suggestions = ElementActionIntentResolver.containerSuggestions(for: intent, inTreeRootedAt: window)
+    #expect(suggestions.map(\.suggestedWithinNamed) == ["Toolbar", "Sidebar"])
+    expectEverySuggestionResolvesToItsOwnCandidate(suggestions, intent: intent, root: window)
+}
+
+@Test func aCandidateThatContainsAnotherCandidateSeparatesOnlyTheInnerOne() async throws {
+    // Finder, 2026-09-10: a window titled "Recent" holding a sidebar label
+    // "Recent". An ancestor chain excludes the node's own name, so the window
+    // has no chain at all and the inner label's chain is ["Recent", "Sidebar"].
+    let innerLabel = AccessibilityElementNode(
+        role: "AXStaticText", subrole: nil, title: nil, value: "Recent",
+        frameInAppKitCoordinates: CGRect(x: 20, y: 400, width: 120, height: 20),
+        depth: 2, children: []
+    )
+    func window(_ children: [AccessibilityElementNode]) -> AccessibilityElementNode {
+        AccessibilityElementNode(
+            role: "AXWindow", subrole: nil, title: "Recent", value: nil,
+            frameInAppKitCoordinates: CGRect(x: 0, y: 0, width: 800, height: 600),
+            depth: 0, children: children
+        )
+    }
+    let intent = ElementActionIntent(role: nil, title: "Recent", action: .select)
+
+    let withSidebar = window([namedContainer("Sidebar", [innerLabel])])
+    let suggestions = ElementActionIntentResolver.containerSuggestions(for: intent, inTreeRootedAt: withSidebar)
+    #expect(suggestions.map(\.node.role) == ["AXWindow", "AXStaticText"])
+    #expect(suggestions.map(\.suggestedWithinNamed) == [nil, "Sidebar"])
+    expectEverySuggestionResolvesToItsOwnCandidate(suggestions, intent: intent, root: withSidebar)
+
+    // With nothing between them, the only separating name is the outer
+    // candidate's own — "the Recent inside Recent". Odd to read, and valid,
+    // because `contains` is exactly what the resolver narrows with.
+    let bare = window([innerLabel])
+    let bareSuggestions = ElementActionIntentResolver.containerSuggestions(for: intent, inTreeRootedAt: bare)
+    #expect(bareSuggestions.map(\.suggestedWithinNamed) == [nil, "Recent"])
+    expectEverySuggestionResolvesToItsOwnCandidate(bareSuggestions, intent: intent, root: bare)
+}

@@ -1074,6 +1074,26 @@ final class HarnessServer {
                 response["resolution"] = ["status": "ambiguous", "matchCount": matchCount]
                 response["ok"] = false
                 response["error"] = "ambiguous"
+                // The free rung, below the picture: every match, each with the
+                // nearest container name that picks it out alone. No capture and
+                // no AX reads — it re-traverses the tree already in memory.
+                let suggestions = ElementActionIntentResolver.containerSuggestions(
+                    for: intent, inTreeRootedAt: rootNode
+                )
+                response["candidates"] = suggestions.prefix(Self.maximumCandidates).enumerated().map {
+                    index, suggestion -> [String: Any] in
+                    var entry = Self.summarise(suggestion.node)
+                    entry["index"] = index
+                    entry["suggestedWithinNamed"] = suggestion.suggestedWithinNamed ?? NSNull()
+                    // Re-issuable only to a verb that resolves by element name.
+                    entry["resolver"] = "elementName"
+                    return entry
+                }
+                if suggestions.count > Self.maximumCandidates {
+                    response["candidatesTruncated"] = true
+                    response["warning"] = "THIS LIST IS A FLOOR, NOT A MEASUREMENT — showing "
+                        + "\(Self.maximumCandidates) of \(suggestions.count) matches"
+                }
                 attachEscalation(to: &response, request: request, rootNode: rootNode)
                 audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ambiguous", startedAt: startedAt)
                 return response
@@ -2245,6 +2265,15 @@ final class HarnessServer {
         // caller asked for and did not get. A capture that then also failed is
         // a second, separate fact and says so where it happened.
         if let code = result.errorCode { block["error"] = code }
+        // Rungs in cost order. An ambiguous response already carries each
+        // match's separating container — structure, and free — so that is
+        // offered before the picture. `notFound` has nothing to separate and
+        // keeps the plain picture hint.
+        if block["hint"] != nil, response["error"] as? String == "ambiguous" {
+            block["hint"] = "first re-issue with a candidate's \"suggestedWithinNamed\" as \"withinNamed\" "
+                + "(free, structural); only if the one you mean has null there, "
+                + "re-issue with \"escalate\": true for an image and candidate points"
+        }
         response["escalation"] = block
     }
 
