@@ -45,7 +45,10 @@ class Run:
     """One task's trail: every request as a short record, plus the counters."""
 
     # Verbs that read "the frontmost app" and so must say which app they mean.
-    APP_SCOPED_VERBS = {"snapshot", "press", "select", "type", "open", "menu", "menus", "look"}
+    # `windows` names its app, but its list is Space-scoped: read while another
+    # app is in front it is a quiet undercount. Measured 2026-09-11, T1 failed
+    # "window count not restored" on a baseline of 0 read from Claude's Space.
+    APP_SCOPED_VERBS = {"snapshot", "press", "select", "type", "open", "menu", "menus", "look", "windows"}
 
     def __init__(self, task_id):
         self.task_id = task_id

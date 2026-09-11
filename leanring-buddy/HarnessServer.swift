@@ -1874,6 +1874,18 @@ final class HarnessServer {
         response["application"] = application.localizedName ?? "unknown"
         response["bundleIdentifier"] = application.bundleIdentifier ?? "unknown"
 
+        // The one guard here that is a separate lookup from the app it reads, and
+        // it has to be: kAXWindows is Space-scoped, so what this list can contain
+        // is decided by whichever app is in front. Measured 2026-09-11: `focus
+        // Finder` confirmed, Claude took focus back 0.9 s later, and `windows
+        // Finder` listed 0 windows from Claude's full-screen Space (1 from Finder's)
+        // — a planner checker counted that as the baseline and failed the task.
+        let frontmost = AccessibilityTreeWalker.focusedApplication()
+        if let refusal = frontmostChangedRefusal(
+            request, name: frontmost?.localizedName, bundleIdentifier: frontmost?.bundleIdentifier,
+            dryRun: dryRun, startedAt: startedAt
+        ) { return response.merging(refusal) { _, new in new } }
+
         let readStartedAt = Date()
         let read = AccessibilityWindows.liveWindows(for: application)
         response["focusMilliseconds"] = Int(Date().timeIntervalSince(readStartedAt) * 1000)
@@ -1891,7 +1903,7 @@ final class HarnessServer {
         // Zero windows from a *successful* read is still not "this app has no
         // windows" — kAXWindows is Space-scoped, measured 2026-09-10. Say so
         // where the count is, not in a footnote.
-        if read.readSucceeded, read.windows.isEmpty, !application.isActive {
+        if read.readSucceeded, read.windows.isEmpty, frontmost?.processIdentifier != application.processIdentifier {
             response["warning"] = "ZERO IS NOT A MEASUREMENT — \(application.localizedName ?? "this app") "
                 + "is not the active application, and kAXWindows only lists windows on the active Space. "
                 + "Focus the app and read again before concluding it has no windows."
