@@ -504,6 +504,10 @@ enum HarnessAnomaly: String, Equatable, CaseIterable {
     /// is the one refusal worth twenty requests of context.
     case securityRefusal = "the kernel refused on a security ground"
 
+    /// The per-app policy file exists and cannot be parsed. Every mutating verb
+    /// is refused until someone fixes it, so the first one gets the context.
+    case policyUnreadable = "the harness policy file is unreadable or malformed"
+
     /// The walk took more than 3x the recent median. "It went sloppy" is
     /// usually this, and it is invisible in a single line.
     case walkFarSlowerThanRecentMedian = "walk took more than 3x the median of recent walks"
@@ -563,6 +567,9 @@ enum HarnessObservability {
         if let kernelReason, ActionSafetyKernel.isSecurityRefusal(reason: kernelReason) {
             return .securityRefusal
         }
+        if errorCode == "policyUnreadable" {
+            return .policyUnreadable
+        }
         if let errorCode, !ordinaryRefusalCodes.contains(errorCode) {
             return .unexpectedError
         }
@@ -590,6 +597,7 @@ final class HarnessServer {
     }
     static var socketURL: URL { supportDirectory.appendingPathComponent("harness.sock") }
     static var killSwitchURL: URL { supportDirectory.appendingPathComponent("HARNESS_DISABLED") }
+    static var policyURL: URL { supportDirectory.appendingPathComponent("harness-policy.json") }
     static var auditLogURL: URL { supportDirectory.appendingPathComponent("harness-audit.log") }
     static var rotatedAuditLogURL: URL { supportDirectory.appendingPathComponent("harness-audit.log.1") }
 
@@ -616,6 +624,11 @@ final class HarnessServer {
     static let sessionIdentifier = String(UUID().uuidString.prefix(8))
 
     private let globalDryRun: Bool
+
+    /// The per-app policy read once by `execute` for the request in flight.
+    /// Requests serialise on the main thread, so one slot is enough; nil means
+    /// no file on disk.
+    private var loadedPolicy: HarnessAppPolicy.Policy?
     private var listeningDescriptor: Int32 = -1
 
     /// The last 20 request/response summaries, **without** the `elements` array
@@ -1018,6 +1031,20 @@ final class HarnessServer {
             return ["ok": false, "error": "killSwitch", "message": killSwitchReason]
         }
 
+        // Read once per request, before a target is even read, and fail closed:
+        // a policy file that cannot be parsed must never become "allow".
+        loadedPolicy = nil
+        if request.verb.isMutating {
+            switch HarnessAppPolicy.load(from: Self.policyURL) {
+            case .loaded(let policy, _): loadedPolicy = policy
+            case .missing: break
+            case .unreadable(let reason):
+                audit(request, dryRun: dryRun, kernel: "n/a", outcome: "policyUnreadable", startedAt: startedAt)
+                return ["ok": false, "error": "policyUnreadable",
+                        "message": "harness policy file is unreadable or malformed — \(reason)"]
+            }
+        }
+
         switch request.verb {
         case .ping:
             audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ok", startedAt: startedAt)
@@ -1118,6 +1145,20 @@ final class HarnessServer {
     }
 
     // MARK: press / select
+
+    /// The per-app layer, composed over the kernel's decision, from the policy
+    /// `execute` already loaded for this request.
+    private func applyAppPolicy(
+        to kernel: SafetyDecision, bundleIdentifier: String?, into response: inout [String: Any]
+    ) -> SafetyDecision {
+        let (verdict, source) = HarnessAppPolicy.verdict(for: bundleIdentifier, in: loadedPolicy)
+        response["policy"] = [
+            "verdict": verdict.rawValue,
+            "source": source,
+            "app": (bundleIdentifier ?? NSNull()) as Any
+        ]
+        return HarnessAppPolicy.compose(policy: verdict, bundleIdentifier: bundleIdentifier, kernel: kernel)
+    }
 
     private func actResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
         guard let action = request.verb.elementAction else {
@@ -1246,12 +1287,15 @@ final class HarnessServer {
             ]
         }
 
-        let decision = ActionSafetyKernel.evaluate(
-            intent: intent,
-            resolvedNode: resolvedNode,
-            matchCount: 1,
-            visibleBounds: rootNode.frameInAppKitCoordinates,
-            typing: typingContext
+        let decision = applyAppPolicy(
+            to: ActionSafetyKernel.evaluate(
+                intent: intent,
+                resolvedNode: resolvedNode,
+                matchCount: 1,
+                visibleBounds: rootNode.frameInAppKitCoordinates,
+                typing: typingContext
+            ),
+            bundleIdentifier: snapshot.bundleIdentifier, into: &response
         )
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
@@ -1601,16 +1645,19 @@ final class HarnessServer {
         response["resolved"] = Self.summarise(resolvedNode)
 
         let intent = ElementActionIntent(role: nil, title: node.label ?? "", action: .menu)
-        let decision = ActionSafetyKernel.evaluate(
-            intent: intent,
-            resolvedNode: resolvedNode,
-            matchCount: 1,
-            // A closed menu item is not drawn, so there are no visible bounds
-            // for it to be inside. `.infinite` says that honestly: the frame
-            // checks do not run for `.menu`, and if they ever did again, a
-            // degenerate frame would still be refused while a real one passes.
-            visibleBounds: .infinite,
-            menuItemEnabled: node.isEnabled
+        let decision = applyAppPolicy(
+            to: ActionSafetyKernel.evaluate(
+                intent: intent,
+                resolvedNode: resolvedNode,
+                matchCount: 1,
+                // A closed menu item is not drawn, so there are no visible bounds
+                // for it to be inside. `.infinite` says that honestly: the frame
+                // checks do not run for `.menu`, and if they ever did again, a
+                // degenerate frame would still be refused while a real one passes.
+                visibleBounds: .infinite,
+                menuItemEnabled: node.isEnabled
+            ),
+            bundleIdentifier: application.bundleIdentifier, into: &response
         )
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
@@ -1970,6 +2017,25 @@ final class HarnessServer {
         response["application"] = application.localizedName ?? "unknown"
         response["bundleIdentifier"] = application.bundleIdentifier ?? "unknown"
 
+        // Judged before the window read, because reading a window on another
+        // Space activates the app — a refused app must never come forward.
+        let appDecision = applyAppPolicy(to: .allow, bundleIdentifier: application.bundleIdentifier, into: &response)
+        let appExecutability = HarnessPolicy.executability(of: appDecision, confirmed: request.confirmed)
+        guard appExecutability.executable else {
+            let described = HarnessPolicy.describe(appDecision)
+            response["kernel"] = [
+                "decision": described.decision,
+                "reason": (described.reason ?? NSNull()) as Any,
+                "executable": false,
+                "note": (appExecutability.reason ?? NSNull()) as Any
+            ]
+            response["ok"] = false
+            let code = described.decision == "refuse" ? "kernelRefused" : "confirmationRequired"
+            response["error"] = code
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: code, startedAt: startedAt)
+            return response
+        }
+
         // A title-less focus is an app activation, and reading the window list
         // is then only worth it to say which window ends up in front — which
         // the observation tier reports anyway. So it is read either way, once.
@@ -2044,7 +2110,10 @@ final class HarnessServer {
             }
         }
 
-        let decision = ActionSafetyKernel.evaluateFocus(windowTitle: kernelTitle, matchCount: matchCount)
+        let decision = applyAppPolicy(
+            to: ActionSafetyKernel.evaluateFocus(windowTitle: kernelTitle, matchCount: matchCount),
+            bundleIdentifier: application.bundleIdentifier, into: &response
+        )
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
         response["kernel"] = [
@@ -2156,7 +2225,10 @@ final class HarnessServer {
         response["bundleIdentifier"] = bundleIdentifier
         response["path"] = url.path
 
-        let decision = ActionSafetyKernel.evaluateLaunch(bundleIdentifier: bundleIdentifier)
+        let decision = applyAppPolicy(
+            to: ActionSafetyKernel.evaluateLaunch(bundleIdentifier: bundleIdentifier),
+            bundleIdentifier: bundleIdentifier, into: &response
+        )
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
         response["kernel"] = [
@@ -2729,6 +2801,7 @@ final class HarnessServer {
         // Security first, above the kernel: `confirmed: true` cannot lift it,
         // like a secure field.
         if AccessibilityStatusItems.isSecure(descriptor) {
+            _ = applyAppPolicy(to: .allow, bundleIdentifier: descriptor.ownerBundleIdentifier, into: &response)
             response["kernel"] = [
                 "decision": "refuse",
                 "reason": "a credential manager's status item is refused, like a secure field",
@@ -2755,14 +2828,17 @@ final class HarnessServer {
             publishedActionNames: descriptor.publishedActionNames,
             accessibilityElement: item.element
         )
-        let decision = ActionSafetyKernel.evaluate(
-            intent: ElementActionIntent(role: nil, title: name, action: .menu),
-            resolvedNode: resolvedNode,
-            matchCount: 1,
-            // Off-screen is fine here: the bar slides to y=-67 in a full-screen
-            // Space and `AXPress` still returns 0.
-            visibleBounds: .infinite,
-            menuItemEnabled: descriptor.isEnabled
+        let decision = applyAppPolicy(
+            to: ActionSafetyKernel.evaluate(
+                intent: ElementActionIntent(role: nil, title: name, action: .menu),
+                resolvedNode: resolvedNode,
+                matchCount: 1,
+                // Off-screen is fine here: the bar slides to y=-67 in a full-screen
+                // Space and `AXPress` still returns 0.
+                visibleBounds: .infinite,
+                menuItemEnabled: descriptor.isEnabled
+            ),
+            bundleIdentifier: descriptor.ownerBundleIdentifier, into: &response
         )
         let described = HarnessPolicy.describe(decision)
         let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)

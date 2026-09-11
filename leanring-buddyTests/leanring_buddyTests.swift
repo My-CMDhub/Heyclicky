@@ -2523,3 +2523,115 @@ private func expectEverySuggestionResolvesToItsOwnCandidate(
     #expect(ApplicationLauncher.runningMatches(named: "finder", among: running) == [finder])
     #expect(ApplicationLauncher.runningMatches(named: "Find", among: running).isEmpty)
 }
+
+// MARK: - Per-app harness policy
+
+@Test func aPolicyFileNamesADefaultAndAVerdictPerBundleIdentifier() async throws {
+    let data = Data("""
+    { "default": "confirm", "apps": { "com.apple.Passwords.MenuBarExtra": "refuse", "com.apple.Terminal": "confirm" } }
+    """.utf8)
+    let policy = try HarnessAppPolicy.parse(data).get()
+    #expect(policy.defaultVerdict == .confirm)
+    #expect(policy.apps["com.apple.passwords.menubarextra"] == .refuse)
+    #expect(policy.apps.count == 2)
+}
+
+@Test func aPolicyFileWithNoDefaultDefaultsToAllow() async throws {
+    let policy = try HarnessAppPolicy.parse(Data(#"{ "apps": { "com.apple.Terminal": "refuse" } }"#.utf8)).get()
+    #expect(policy.defaultVerdict == .allow)
+    #expect(policy.apps["com.apple.terminal"] == .refuse)
+}
+
+@Test func anUnknownVerdictOrMalformedJSONIsAParseFailureNotADefault() async throws {
+    // Fail closed: "maybe" must not read as "allow".
+    let unknown = HarnessAppPolicy.parse(Data(#"{ "apps": { "com.apple.Terminal": "maybe" } }"#.utf8))
+    #expect((try? unknown.get()) == nil)
+    let malformed = HarnessAppPolicy.parse(Data(#"{ "default": "allow", "apps": "#.utf8))
+    #expect((try? malformed.get()) == nil)
+}
+
+@Test func aBundleIdentifierMatchesThePolicyCaseInsensitivelyAndUnlistedAppsGetTheDefault() async throws {
+    let policy = HarnessAppPolicy.Policy(defaultVerdict: .confirm, apps: ["com.apple.terminal": .refuse])
+
+    let listed = HarnessAppPolicy.verdict(for: "COM.APPLE.terminal", in: policy)
+    #expect(listed.0 == .refuse)
+    #expect(listed.source == "file")
+
+    let unlisted = HarnessAppPolicy.verdict(for: "com.apple.finder", in: policy)
+    #expect(unlisted.0 == .confirm)
+    #expect(unlisted.source == "default")
+
+    // No bundle identifier at all is "not listed", never a match.
+    let anonymous = HarnessAppPolicy.verdict(for: nil, in: policy)
+    #expect(anonymous.0 == .confirm)
+    #expect(anonymous.source == "default")
+}
+
+@Test func appPolicyComposesOverTheKernelAndARefuseAlwaysWins() async throws {
+    let app = "com.apple.Terminal"
+    let kernelQuestion = SafetyDecision.requireConfirmation(reason: "title suggests a destructive action: delete")
+    let kernelRefusal = SafetyDecision.refuse(reason: ActionSafetyKernel.zeroAreaRefusalReason)
+
+    // Policy refuse beats everything.
+    for kernel in [SafetyDecision.allow, kernelQuestion, kernelRefusal] {
+        #expect(HarnessAppPolicy.compose(policy: .refuse, bundleIdentifier: app, kernel: kernel)
+                == .refuse(reason: "app policy refuses \(app)"))
+    }
+
+    // A kernel refuse is stronger than a policy confirm.
+    #expect(HarnessAppPolicy.compose(policy: .confirm, bundleIdentifier: app, kernel: kernelRefusal) == kernelRefusal)
+
+    // Confirm over allow asks; confirm over a kernel question asks once, carrying both reasons.
+    #expect(HarnessAppPolicy.compose(policy: .confirm, bundleIdentifier: app, kernel: .allow)
+            == .requireConfirmation(reason: "app policy requires confirmation for \(app)"))
+    guard case .requireConfirmation(let reason) =
+            HarnessAppPolicy.compose(policy: .confirm, bundleIdentifier: app, kernel: kernelQuestion) else {
+        Issue.record("confirm over requireConfirmation must stay a question")
+        return
+    }
+    #expect(reason.contains("app policy requires confirmation for \(app)"))
+    #expect(reason.contains("destructive action: delete"))
+
+    // Allow passes the kernel through untouched.
+    for kernel in [SafetyDecision.allow, kernelQuestion, kernelRefusal] {
+        #expect(HarnessAppPolicy.compose(policy: .allow, bundleIdentifier: app, kernel: kernel) == kernel)
+    }
+
+    // `confirmed: true` cannot lift a policy refusal — a refuse is never executable.
+    let refused = HarnessAppPolicy.compose(policy: .refuse, bundleIdentifier: app, kernel: .allow)
+    #expect(HarnessPolicy.executability(of: refused, confirmed: true).executable == false)
+}
+
+@Test func twoPolicyKeysDifferingOnlyInCaseRefuseTheWholeFile() async throws {
+    // Order-undefined between "refuse" and "allow" is not a policy; fail closed.
+    let clash = HarnessAppPolicy.parse(Data(#"{ "apps": { "com.apple.Terminal": "refuse", "com.apple.terminal": "allow" } }"#.utf8))
+    guard case .failure(let failure) = clash else {
+        Issue.record("a case-colliding apps map must not parse")
+        return
+    }
+    #expect(failure.reason.lowercased().contains("com.apple.terminal"))
+}
+
+@Test func aMissingPolicyFileIsAllowFromMissingAndADanglingSymlinkIsUnreadable() async throws {
+    let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: scratch) }
+
+    #expect(HarnessAppPolicy.load(from: scratch.appendingPathComponent("absent.json")) == .missing)
+    #expect(HarnessAppPolicy.verdict(for: "com.apple.finder", in: nil) == (.allow, "missing"))
+
+    // `fileExists` follows the link and says no; that is not "no file".
+    let link = scratch.appendingPathComponent("dangling.json")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: scratch.appendingPathComponent("nowhere.json"))
+    guard case .unreadable = HarnessAppPolicy.load(from: link) else {
+        Issue.record("a dangling symlink read as missing, which becomes allow")
+        return
+    }
+}
+
+@Test func anUnreadablePolicyFileIsItsOwnAnomaly() async throws {
+    #expect(HarnessObservability.anomaly(
+        kernelDecision: nil, verificationStatus: nil, errorCode: "policyUnreadable",
+        walkMilliseconds: nil, recentWalkMilliseconds: []
+    ) == .policyUnreadable)
+}
