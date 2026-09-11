@@ -304,9 +304,10 @@ enum AccessibilityActionPerformer {
     /// same error code and opposite problems, and only the clock separates them.
     static func perform(
         _ actionName: String,
-        on element: AXUIElement
+        on element: AXUIElement,
+        timeoutInSeconds: Float = actionTimeoutInSeconds
     ) -> (error: AXError, milliseconds: Int) {
-        AXUIElementSetMessagingTimeout(element, actionTimeoutInSeconds)
+        AXUIElementSetMessagingTimeout(element, timeoutInSeconds)
         let startedAt = Date()
         let error = AXUIElementPerformAction(element, actionName as CFString)
         return (error, Int(Date().timeIntervalSince(startedAt) * 1000))

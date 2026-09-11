@@ -1586,6 +1586,100 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
     #expect(HarnessPolicy.killSwitchRefusal(verb: .menus, killSwitchPresent: true) == nil)
 }
 
+// MARK: - Status items
+
+@Test func aStatusItemMatchesOnIdentifierBeforeNameBeforeOwner() async throws {
+    typealias D = AccessibilityStatusItems.Descriptor
+    let items = [
+        D(ownerName: "Control Centre", ownerBundleIdentifier: "com.apple.controlcenter",
+          identifier: "com.apple.menuextra.wifi", title: nil, elementDescription: "Wi\u{2011}Fi, connected, 3 bars"),
+        D(ownerName: "Spotlight", ownerBundleIdentifier: "com.apple.Spotlight",
+          identifier: nil, title: "Spotlight", elementDescription: "Search"),
+        // Anonymous: only the owning app names them. Measured 2026-09-12 on
+        // Cursor, Claude, Wispr Flow and Clicky — title "", desc "", identifier "".
+        D(ownerName: "Cursor", ownerBundleIdentifier: "com.todesktop.230313mzl4w4u92",
+          identifier: nil, title: "", elementDescription: ""),
+        D(ownerName: "Claude", ownerBundleIdentifier: "com.anthropic.claudefordesktop",
+          identifier: nil, title: "", elementDescription: "")
+    ]
+
+    #expect(AccessibilityStatusItems.match("COM.APPLE.MENUEXTRA.WIFI", among: items)
+        == .resolved(index: 0, tier: .identifier))
+    #expect(AccessibilityStatusItems.match("spotlight", among: items) == .resolved(index: 1, tier: .name))
+    #expect(AccessibilityStatusItems.match("Search", among: items) == .resolved(index: 1, tier: .name))
+    // Exact only: ASCII hyphen against U+2011 is a miss, by design.
+    if case .notFound = AccessibilityStatusItems.match("Wi-Fi, connected, 3 bars", among: items) {} else {
+        Issue.record("an ASCII hyphen must not match a non-breaking one")
+    }
+    // Anonymous items are reached by owner.
+    #expect(AccessibilityStatusItems.match("com.anthropic.claudefordesktop", among: items)
+        == .resolved(index: 3, tier: .owner))
+    #expect(AccessibilityStatusItems.match("cursor", among: items) == .resolved(index: 2, tier: .owner))
+
+    // Two from the same owner is a question, never a coin flip.
+    let twoFromCursor = items + [D(ownerName: "Cursor", ownerBundleIdentifier: "com.todesktop.230313mzl4w4u92",
+                                   identifier: nil, title: nil, elementDescription: nil)]
+    #expect(AccessibilityStatusItems.match("Cursor", among: twoFromCursor) == .ambiguous(matchCount: 2, tier: .owner))
+
+    // A miss lists what IS there, best name each, sorted.
+    #expect(AccessibilityStatusItems.match("Battery", among: items) == .notFound(available: [
+        "<owner: Claude>", "<owner: Cursor>", "Spotlight", "com.apple.menuextra.wifi"
+    ]))
+}
+
+@Test func aCredentialManagersStatusItemIsSecure() async throws {
+    typealias D = AccessibilityStatusItems.Descriptor
+    #expect(AccessibilityStatusItems.isSecure(D(
+        ownerName: "Passwords", ownerBundleIdentifier: "com.apple.Passwords.MenuBarExtra",
+        identifier: nil, title: "apple.passwords", elementDescription: nil
+    )))
+    #expect(!AccessibilityStatusItems.isSecure(D(
+        ownerName: "Control Centre", ownerBundleIdentifier: "com.apple.controlcenter",
+        identifier: "com.apple.menuextra.battery", title: nil, elementDescription: "Battery"
+    )))
+    #expect(!AccessibilityStatusItems.isSecure(D(
+        ownerName: nil, ownerBundleIdentifier: nil, identifier: nil, title: nil, elementDescription: nil
+    )))
+}
+
+@Test func aMenuRequestTakesAPathOrAStatusItemNeverBoth() async throws {
+    guard case .success(let request) = HarnessPolicy.decode(
+        line: #"{"id":"1","verb":"menu","statusItem":"com.apple.menuextra.wifi"}"#
+    ) else {
+        Issue.record("a status item is a complete menu target")
+        return
+    }
+    #expect(request.path.isEmpty)
+    #expect(request.statusItem == "com.apple.menuextra.wifi")
+    // The audit line's target is the item, so the log says what was pressed.
+    #expect(request.title == "com.apple.menuextra.wifi")
+
+    if case .failure(let error) = HarnessPolicy.decode(line: #"{"id":"2","verb":"menu"}"#) {
+        #expect(error == .missingField("path"))
+    } else { Issue.record("neither target should be refused") }
+
+    if case .failure(let error) = HarnessPolicy.decode(
+        line: #"{"id":"3","verb":"menu","path":["File"],"statusItem":"Spotlight"}"#
+    ) {
+        #expect(error == .invalidField(field: "statusItem", value: "Spotlight"))
+    } else { Issue.record("two targets in one request should be refused") }
+
+    if case .failure(let error) = HarnessPolicy.decode(line: #"{"id":"4","verb":"menu","statusItem":""}"#) {
+        #expect(error == .invalidField(field: "statusItem", value: ""))
+    } else { Issue.record("an empty status item is a typo, not a target") }
+}
+
+@Test func theStatusListingIsReadOnlyAndSurvivesTheKillSwitch() async throws {
+    guard case .success(let request) = HarnessPolicy.decode(line: #"{"id":"5","verb":"status"}"#) else {
+        Issue.record("status needs no fields")
+        return
+    }
+    #expect(request.verb == .status)
+    #expect(request.verb.isMutating == false)
+    #expect(request.verb.elementAction == nil)
+    #expect(HarnessPolicy.killSwitchRefusal(verb: .status, killSwitchPresent: true) == nil)
+}
+
 @Test func openingAlwaysAsksAHumanNoMatterTheRole() async throws {
     // AXOpen launches whatever the thing is. Measured 2026-09-10 in Finder:
     // 446 named AXTextFields publish it (the file list). Auto-allowing the

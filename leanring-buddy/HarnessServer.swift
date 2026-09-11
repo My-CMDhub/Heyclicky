@@ -40,6 +40,8 @@ struct HarnessRawRequest: Decodable {
 
     /// menu / menus only: the path down the menu bar, e.g. ["File", "New Folder"].
     let path: [String]?
+    /// menu only: a status icon instead of a path — identifier, name, or owner.
+    let statusItem: String?
 
     /// windows / focus only: which application, by bundle identifier or name.
     /// Absent means the frontmost one, which is what every other verb assumes.
@@ -100,12 +102,17 @@ enum HarnessVerb: String, CaseIterable {
     /// exact name, and wait until it says it is in front.
     case launch
 
+    /// Every status icon on the menu bar's right side, from every process that
+    /// owns one. Read-only, and its own verb because it is a sweep over ~45
+    /// processes (1.6 s), not a read of the frontmost app.
+    case status
+
     /// Whether this verb can change the world. The kill switch stops these and
     /// leaves the read-only pair working, so an operator who tripped it can
     /// still look at the machine and find out why.
     var isMutating: Bool {
         switch self {
-        case .ping, .snapshot, .menus, .windows, .look: return false
+        case .ping, .snapshot, .menus, .windows, .look, .status: return false
         case .press, .select, .type, .open, .menu, .focus, .launch: return true
         }
     }
@@ -128,7 +135,7 @@ enum HarnessVerb: String, CaseIterable {
         // `look` is nil for a third reason: it does not act at all. It resolves
         // a name only to find out how many things carry it.
         // `launch` targets an application, not an element: `evaluateLaunch`.
-        case .ping, .snapshot, .menu, .menus, .windows, .focus, .look, .launch: return nil
+        case .ping, .snapshot, .menu, .menus, .windows, .focus, .look, .launch, .status: return nil
         }
     }
 }
@@ -192,6 +199,8 @@ struct HarnessRequest: Equatable {
 
     /// menu / menus only.
     var path: [String] = []
+    /// menu only: press a status icon instead of a path. One target per request.
+    var statusItem: String? = nil
 
     /// windows / focus only. nil means the frontmost application.
     var app: String? = nil
@@ -252,8 +261,18 @@ enum HarnessPolicy {
         // A menu path is that verb's whole aim, so an empty one is a missing
         // field rather than "the menu bar itself".
         let path = raw.path ?? []
-        if verb == .menu, path.isEmpty {
-            return .failure(.missingField("path"))
+        var statusItem: String?
+        if verb == .menu {
+            if let requested = raw.statusItem {
+                // Empty is a typo, not "any icon"; and with a path too there
+                // would be two targets in one request.
+                guard !requested.isEmpty, path.isEmpty else {
+                    return .failure(.invalidField(field: "statusItem", value: requested))
+                }
+                statusItem = requested
+            } else if path.isEmpty {
+                return .failure(.missingField("path"))
+            }
         }
 
         // `focus` aims with either half: an app (bring Finder forward), a title
@@ -312,7 +331,7 @@ enum HarnessPolicy {
             // a second field only two verbs would ever set.
             title: (verb == .menu || verb == .menus) && !path.isEmpty
                 ? path.joined(separator: " > ")
-                : (raw.title ?? ""),
+                : (statusItem ?? raw.title ?? ""),
             role: raw.role,
             withinNamed: raw.withinNamed,
             nearPoint: raw.nearPoint?.cgPoint,
@@ -323,6 +342,7 @@ enum HarnessPolicy {
             aimAtFocus: aimAtFocus,
             thenConfirm: raw.thenConfirm ?? false,
             path: path,
+            statusItem: statusItem,
             app: (raw.app?.isEmpty == false) ? raw.app : nil,
             expectApp: raw.expectApp,
             tier: tier,
@@ -1017,7 +1037,12 @@ final class HarnessServer {
             return actResponse(request, dryRun: dryRun, startedAt: startedAt)
 
         case .menu:
-            return menuResponse(request, dryRun: dryRun, startedAt: startedAt)
+            return request.statusItem != nil
+                ? statusItemPressResponse(request, dryRun: dryRun, startedAt: startedAt)
+                : menuResponse(request, dryRun: dryRun, startedAt: startedAt)
+
+        case .status:
+            return statusResponse(request, dryRun: dryRun, startedAt: startedAt)
 
         case .menus:
             return menusResponse(request, dryRun: dryRun, startedAt: startedAt)
@@ -2626,6 +2651,207 @@ final class HarnessServer {
             kernel: (result.payload["kernel"] as? [String: Any])?["decision"] as? String ?? "n/a",
             outcome: result.errorCode ?? "ok", startedAt: startedAt
         )
+        return response
+    }
+
+    // MARK: status
+
+    /// How long a status-item press may take to show up as a new window, a new
+    /// child, or a focus change. Measured 2026-09-12: Wi‑Fi's dropdown was a new
+    /// Control Centre AXWindow within ~50 ms.
+    static let statusItemVerificationDeadlineInSeconds = 2.0
+    static let statusMenuPressTimeoutInSeconds: Float = 0.5
+
+    private static func summariseStatusItem(_ descriptor: AccessibilityStatusItems.Descriptor) -> [String: Any] {
+        let frame = descriptor.frameInAppKitCoordinates
+        return [
+            "owner": [
+                "name": (descriptor.ownerName ?? NSNull()) as Any,
+                "bundleIdentifier": (descriptor.ownerBundleIdentifier ?? NSNull()) as Any
+            ],
+            "identifier": (descriptor.identifier ?? NSNull()) as Any,
+            // Raw, because JSON encoding is the escaping — same rule as `summarise`.
+            "title": (descriptor.title?.raw ?? NSNull()) as Any,
+            "description": (descriptor.elementDescription?.raw ?? NSNull()) as Any,
+            "value": (descriptor.value?.raw ?? NSNull()) as Any,
+            "enabled": descriptor.isEnabled,
+            "frame": ["x": frame.origin.x, "y": frame.origin.y, "w": frame.size.width, "h": frame.size.height],
+            "actions": descriptor.publishedActionNames,
+            "hasMenu": descriptor.hasMenu,
+            "secure": AccessibilityStatusItems.isSecure(descriptor)
+        ]
+    }
+
+    /// Not app-scoped: icons are global, so no `expectApp` and no frontmost check.
+    private func statusResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        let read = AccessibilityStatusItems.readAll()
+        audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ok", startedAt: startedAt)
+        return [
+            "ok": true,
+            "itemCount": read.items.count,
+            "processesAsked": read.processesAsked,
+            "processesAnswered": read.processesAnswered,
+            "statusMilliseconds": read.milliseconds,
+            "items": read.items.map { Self.summariseStatusItem($0.descriptor) }
+        ]
+    }
+
+    private func statusItemPressResponse(_ request: HarnessRequest, dryRun: Bool, startedAt: Date) -> [String: Any] {
+        let query = request.statusItem ?? ""
+        var response: [String: Any] = ["dryRun": dryRun, "confirmed": request.confirmed, "statusItem": query]
+
+        let read = AccessibilityStatusItems.readAll()
+        response["statusMilliseconds"] = read.milliseconds
+        let item: AccessibilityStatusItems.Item
+        switch AccessibilityStatusItems.match(query, among: read.items.map(\.descriptor)) {
+        case .resolved(let index, let tier):
+            item = read.items[index]
+            response["resolution"] = ["status": "resolved", "matchedOn": tier.rawValue]
+        case .ambiguous(let matchCount, let tier):
+            response["resolution"] = ["status": "ambiguous", "matchCount": matchCount, "matchedOn": tier.rawValue]
+            response["ok"] = false
+            response["error"] = "ambiguous"
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: "ambiguous", startedAt: startedAt)
+            return response
+        case .notFound(let available):
+            response["resolution"] = [
+                "status": "notFound",
+                "available": available.map { UntrustedText($0).forDisplay }
+            ]
+            response["ok"] = false
+            response["error"] = "notFound"
+            audit(request, dryRun: dryRun, kernel: "n/a", outcome: "notFound", startedAt: startedAt)
+            return response
+        }
+        let descriptor = item.descriptor
+        response["item"] = Self.summariseStatusItem(descriptor)
+
+        // Security first, above the kernel: `confirmed: true` cannot lift it,
+        // like a secure field.
+        if AccessibilityStatusItems.isSecure(descriptor) {
+            response["kernel"] = [
+                "decision": "refuse",
+                "reason": "a credential manager's status item is refused, like a secure field",
+                "executable": false
+            ]
+            response["ok"] = false
+            response["error"] = "kernelRefused"
+            audit(request, dryRun: dryRun, kernel: "refuse", outcome: "kernelRefused", startedAt: startedAt)
+            return response
+        }
+
+        // An anonymous item (Cursor, Claude, Wispr Flow: title "", description
+        // "") is named by its owner, or the kernel refuses an empty label.
+        let name = descriptor.identifier ?? descriptor.title?.raw ?? descriptor.elementDescription?.raw
+            ?? descriptor.ownerName ?? ""
+        let resolvedNode = AccessibilityElementNode(
+            role: AccessibilityMenu.menuBarItemRole, subrole: nil,
+            // The kernel judges the NODE's label, so the owner-name fallback
+            // has to be here too, or an anonymous item is refused as unnamed.
+            title: descriptor.title?.raw ?? name, value: descriptor.value?.raw,
+            elementDescription: descriptor.elementDescription?.raw,
+            frameInAppKitCoordinates: descriptor.frameInAppKitCoordinates,
+            depth: 0, children: [],
+            publishedActionNames: descriptor.publishedActionNames,
+            accessibilityElement: item.element
+        )
+        let decision = ActionSafetyKernel.evaluate(
+            intent: ElementActionIntent(role: nil, title: name, action: .menu),
+            resolvedNode: resolvedNode,
+            matchCount: 1,
+            // Off-screen is fine here: the bar slides to y=-67 in a full-screen
+            // Space and `AXPress` still returns 0.
+            visibleBounds: .infinite,
+            menuItemEnabled: descriptor.isEnabled
+        )
+        let described = HarnessPolicy.describe(decision)
+        let executability = HarnessPolicy.executability(of: decision, confirmed: request.confirmed)
+        response["kernel"] = [
+            "decision": described.decision,
+            "reason": (described.reason ?? NSNull()) as Any,
+            "executable": executability.executable,
+            "note": (executability.reason ?? NSNull()) as Any
+        ]
+        guard executability.executable else {
+            let outcome = described.decision == "refuse" ? "kernelRefused" : "confirmationRequired"
+            response["ok"] = false
+            response["error"] = outcome
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: outcome, startedAt: startedAt)
+            return response
+        }
+        guard !dryRun else {
+            response["ok"] = true
+            response["performed"] = ["status": "skipped", "reason": "dry run — nothing was performed"]
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "dryRun", startedAt: startedAt)
+            return response
+        }
+
+        // Four baselines, because a press moves a different one per shape.
+        // Measured 2026-09-12: Wi‑Fi opens a new Control Centre window (0 -> 1)
+        // and makes it frontmost, its item's `AXSelected` stays false; Cursor's
+        // menu item moves NOTHING but `AXSelected` (false -> true) — its 9 menu
+        // children were readable before the press, like an app menu's.
+        let owner = NSRunningApplication(processIdentifier: descriptor.ownerProcessIdentifier)
+        let ownerPid = descriptor.ownerProcessIdentifier
+        let windowsBefore = owner.flatMap(AccessibilityMenu.windowCount)
+        let childrenBefore = AccessibilityStatusItems.childCount(of: item.element)
+        let selectedBefore = AccessibilityStatusItems.isSelected(item.element)
+        let ownerWasFrontmost = AccessibilityTreeWalker.frontmost().application?.processIdentifier == ownerPid
+        response["windowsBefore"] = (windowsBefore ?? NSNull()) as Any
+
+        // An item with a menu tracks that menu INSIDE its action callback, so
+        // the press does not return until the menu closes: measured -25204 at
+        // 507 ms on Cursor with the menu plainly open. The performer's 5 s would
+        // only hold this thread five times longer. A short timeout, and -25204
+        // is "sent, unconfirmed" — the verification decides, not the code.
+        let result = AccessibilityActionPerformer.perform(
+            kAXPressAction, on: item.element,
+            timeoutInSeconds: descriptor.hasMenu ? Self.statusMenuPressTimeoutInSeconds
+                : AccessibilityActionPerformer.actionTimeoutInSeconds
+        )
+        let sentUnconfirmed = result.error == .cannotComplete && descriptor.hasMenu
+        response["performed"] = [
+            "status": result.error == .success ? "sent" : (sentUnconfirmed ? "sentUnconfirmed" : "failed"),
+            "axErrorRawValue": result.error.rawValue,
+            "milliseconds": result.milliseconds
+        ]
+        guard result.error == .success || sentUnconfirmed else {
+            response["ok"] = false
+            response["error"] = "performFailed"
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "performFailed", startedAt: startedAt)
+            return response
+        }
+
+        let verifyStartedAt = Date()
+        var evidence: String?
+        while evidence == nil,
+              Date().timeIntervalSince(verifyStartedAt) < Self.statusItemVerificationDeadlineInSeconds {
+            if let windowsBefore, let owner, AccessibilityMenu.windowCount(for: owner) != windowsBefore {
+                evidence = "the owner's window count changed"
+            } else if AccessibilityStatusItems.childCount(of: item.element) != childrenBefore {
+                evidence = "the item's child count changed"
+            } else if AccessibilityStatusItems.isSelected(item.element) != selectedBefore {
+                evidence = "the item's AXSelected changed"
+            } else if !ownerWasFrontmost,
+                      AccessibilityTreeWalker.frontmost().application?.processIdentifier == ownerPid {
+                evidence = "the owner became frontmost"
+            } else {
+                usleep(AccessibilityWindows.observationPollIntervalInMicroseconds)
+            }
+        }
+        let verifyMilliseconds = Int(Date().timeIntervalSince(verifyStartedAt) * 1000)
+        response["windowsAfter"] = (owner.flatMap(AccessibilityMenu.windowCount) ?? NSNull()) as Any
+
+        if let evidence {
+            response["verification"] = ["status": "confirmed", "evidence": evidence, "milliseconds": verifyMilliseconds]
+            response["ok"] = true
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "confirmed", startedAt: startedAt)
+        } else {
+            response["verification"] = ["status": "notObserved", "milliseconds": verifyMilliseconds]
+            response["ok"] = false
+            response["error"] = "notVerified"
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "notObserved", startedAt: startedAt)
+        }
         return response
     }
 
