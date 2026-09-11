@@ -5,7 +5,7 @@
 //  Which window the harness is looking at, and how to make it a different one.
 //
 //  Everything else in this project anchors on
-//  `NSWorkspace.shared.frontmostApplication` — `snapshotFocusedWindow`,
+//  `AccessibilityTreeWalker.focusedApplication()` — `snapshotFocusedWindow`,
 //  `menuBarNode(for:)`, the audit line's `app` field. That is the right default
 //  and a useless ceiling: the harness can only ever act on whatever the human
 //  happened to leave in front. These two verbs are the aim, one tier up from
@@ -363,6 +363,9 @@ enum AccessibilityWindows {
         var observed = false
         var observedMilliseconds = 0
         var observedApplication: String?
+        /// Which read matched the app on the last poll: "systemWide" or
+        /// "applicationFrontmost". Nil when neither did.
+        var observedVia: String?
         var observedWindowTitle: UntrustedText?
     }
 
@@ -371,7 +374,7 @@ enum AccessibilityWindows {
     /// Focus is the one verb with a trivial inverse, and the inverse is only
     /// trivial if you know what it was.
     static func previousApplication() -> (name: String?, bundleIdentifier: String?)? {
-        guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
+        guard let application = AccessibilityTreeWalker.focusedApplication() else { return nil }
         return (application.localizedName, application.bundleIdentifier)
     }
 
@@ -450,6 +453,11 @@ enum AccessibilityWindows {
             // re-entrancy — a second socket request could land inside this one.
             // A system-wide AX read is a live cross-process query that needs no
             // run loop at all, so it is both correct and cheaper.
+            //
+            // But not always there. Measured 2026-09-11: `focus Cursor` returned
+            // `notVerified` after 2,047 ms with Cursor plainly in front — the
+            // system-wide read answers -25212 for an Electron app until its
+            // accessibility is switched on. Only then is the app asked itself.
             var focusedApplication: AXUIElement?
             if let value = copyValue(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as String),
                CFGetTypeID(value) == AXUIElementGetTypeID() {
@@ -474,7 +482,18 @@ enum AccessibilityWindows {
                 outcome.observedWindowTitle = nil
             }
 
-            let applicationMatches = focusedProcessIdentifier == wantedProcessIdentifier
+            // The app is asked only when the system-wide read gave NO answer. A live
+            // answer naming another app is a no, and an app's own "yes" mid-switch
+            // must not outvote it.
+            if focusedProcessIdentifier == wantedProcessIdentifier {
+                outcome.observedVia = "systemWide"
+            } else if focusedApplication == nil,
+                      copyValue(applicationElement, kAXFrontmostAttribute as String) as? Bool == true {
+                outcome.observedVia = "applicationFrontmost"
+            } else {
+                outcome.observedVia = nil
+            }
+            let applicationMatches = outcome.observedVia != nil
             let windowMatches = wantedWindow == nil || focusedWindow == wantedWindow
             if applicationMatches && windowMatches {
                 outcome.observed = true

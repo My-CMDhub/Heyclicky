@@ -244,6 +244,10 @@ struct AccessibilityWindowSnapshot {
     /// describes a window that had already gone to the background. The elements
     /// read after the switch may not match the ones read before it.
     let focusChangedDuringWalk: Bool
+
+    /// Which source named the app this walk treated as frontmost. Nil for a
+    /// walk of a window the caller named, which was never "whatever is in front".
+    var frontmostSource: AccessibilityTreeWalker.FrontmostSource? = nil
 }
 
 enum AccessibilitySnapshotError: Error {
@@ -378,20 +382,83 @@ enum AccessibilityTreeWalker {
     ///
     /// Falls back to `NSWorkspace` only when Accessibility cannot answer; between
     /// requests the run loop has turned and that value is current. `focus`
-    /// keeps its own read deliberately, with no fallback, because a stale
-    /// fallback there would reintroduce the exact bug it measures.
+    /// keeps its own read deliberately, with no `NSWorkspace` fallback, because
+    /// a stale fallback there would reintroduce the exact bug it measures.
+    ///
+    /// And Accessibility does not always answer. Measured 2026-09-11: with a
+    /// Chromium/Electron app in front the read returns -25212 in 0 ms until some
+    /// client switches that app's accessibility on — Cursor answered -25212 x3,
+    /// then "Cursor" 1.5 s after an `AXManualAccessibility` write. So the
+    /// fallback is common, and `frontmost()` now reports which source answered.
     static func focusedApplication() -> NSRunningApplication? {
+        frontmost().application
+    }
+
+    /// Which source named the frontmost application.
+    enum FrontmostSource: String {
+        /// The system-wide `kAXFocusedApplicationAttribute`. Live.
+        case accessibility
+        /// The `NSWorkspace` cache, and that app's own `kAXFrontmostAttribute`
+        /// says yes — which answers for Electron apps too.
+        case cacheConfirmedByApp
+        /// The `NSWorkspace` cache, possibly frozen for this whole request.
+        case cacheUnconfirmed
+    }
+
+    struct FrontmostRead {
+        let application: NSRunningApplication?
+        let source: FrontmostSource
+        /// The system-wide read's raw `AXError`; nil when it answered, or when it
+        /// succeeded and named no running app.
+        let systemWideErrorRawValue: Int32?
+    }
+
+    /// Pure, so a test reaches it. A failed read of the app's own attribute is
+    /// not a yes.
+    static func frontmostSource(
+        systemWideAnswered: Bool,
+        cachedApplicationSaysFrontmost: Bool?
+    ) -> FrontmostSource {
+        if systemWideAnswered { return .accessibility }
+        return cachedApplicationSaysFrontmost == true ? .cacheConfirmedByApp : .cacheUnconfirmed
+    }
+
+    /// `focusedApplication()` with its provenance — see there for why.
+    static func frontmost() -> FrontmostRead {
         var value: AnyObject?
-        if AXUIElementCopyAttributeValue(
+        let systemWideError = AXUIElementCopyAttributeValue(
             AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &value
-        ) == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
+        )
+        if systemWideError == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
             var processIdentifier: pid_t = 0
             if AXUIElementGetPid(value as! AXUIElement, &processIdentifier) == .success,
                let application = NSRunningApplication(processIdentifier: processIdentifier) {
-                return application
+                return FrontmostRead(application: application, source: .accessibility, systemWideErrorRawValue: nil)
             }
         }
-        return NSWorkspace.shared.frontmostApplication
+
+        let cached = NSWorkspace.shared.frontmostApplication
+        var cachedApplicationSaysFrontmost: Bool?
+        if let cached {
+            let element = AXUIElementCreateApplication(cached.processIdentifier)
+            AXUIElementSetMessagingTimeout(element, 0.5)
+            var frontmostValue: AnyObject?
+            if AXUIElementCopyAttributeValue(element, kAXFrontmostAttribute as CFString, &frontmostValue) == .success {
+                cachedApplicationSaysFrontmost = frontmostValue as? Bool
+            }
+        }
+        // ponytail: an unconfirmed cache is still returned, labelled, not dropped.
+        // If `cacheUnconfirmed` ever shows up in harness-audit.log, confirm instead
+        // with the front-most layer-0 owner from
+        // `CGWindowListCopyWindowInfo(.optionOnScreenOnly)`, checked against its own
+        // `kAXFrontmostAttribute`.
+        return FrontmostRead(
+            application: cached,
+            source: frontmostSource(
+                systemWideAnswered: false, cachedApplicationSaysFrontmost: cachedApplicationSaysFrontmost
+            ),
+            systemWideErrorRawValue: systemWideError == .success ? nil : systemWideError.rawValue
+        )
     }
 
     /// Walks the focused window of the frontmost application.
@@ -414,7 +481,8 @@ enum AccessibilityTreeWalker {
         // Bounded before the first cross-process read, which is now the one below.
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)
 
-        guard let frontmostApplication = focusedApplication() else {
+        let frontmostRead = frontmost()
+        guard let frontmostApplication = frontmostRead.application else {
             throw AccessibilitySnapshotError.noFrontmostApplication
         }
 
@@ -499,12 +567,14 @@ enum AccessibilityTreeWalker {
             throw AccessibilitySnapshotError.noFocusedWindow
         }
 
-        return try snapshotWindow(
+        var snapshot = try snapshotWindow(
             focusedWindowElement,
             of: frontmostApplication,
             maximumDepth: maximumDepth,
             maximumNodeCount: maximumNodeCount
         )
+        snapshot.frontmostSource = frontmostRead.source
+        return snapshot
     }
 
     /// Walks one window of one application — focused or not.

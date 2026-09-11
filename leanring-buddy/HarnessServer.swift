@@ -414,9 +414,11 @@ enum HarnessPolicy {
         confirmed: Bool,
         kernel: String,
         outcome: String,
-        milliseconds: Int
+        milliseconds: Int,
+        frontmostSource: String? = nil,
+        frontmostSystemWideError: Int32? = nil
     ) -> String {
-        let fields: [String: Any] = [
+        var fields: [String: Any] = [
             "timestamp": auditTimestampFormatter.string(from: timestamp),
             "id": id,
             "verb": verb,
@@ -429,6 +431,10 @@ enum HarnessPolicy {
             "outcome": outcome,
             "ms": milliseconds
         ]
+        // Whether `app` was read live or off the frozen `NSWorkspace` cache —
+        // the only way to count how often a request ran on the cache.
+        if let frontmostSource { fields["frontmostSource"] = frontmostSource }
+        if let frontmostSystemWideError { fields["frontmostSystemWideError"] = Int(frontmostSystemWideError) }
         guard let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else {
             return "{\"timestamp\":\"\(auditTimestampFormatter.string(from: timestamp))\",\"outcome\":\"auditEncodingFailed\"}"
@@ -938,7 +944,7 @@ final class HarnessServer {
     /// Which app a line refers to. Clicky is `LSUIElement`, so it never takes
     /// focus itself — the frontmost app is the one being acted on.
     static func frontmostBundleIdentifier() -> String? {
-        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        AccessibilityTreeWalker.focusedApplication()?.bundleIdentifier
     }
 
     /// The refusal for a request whose `expectApp` is not the app it just read,
@@ -1065,6 +1071,7 @@ final class HarnessServer {
             // complete" this interface will ever say.
             "walkStopReasons": snapshot.walkStopReasons.map(\.rawValue).sorted(),
             "focusChangedDuringWalk": snapshot.focusChangedDuringWalk,
+            "frontmostSource": snapshot.frontmostSource?.rawValue ?? NSNull(),
             "actionableCount": actionable.count,
             "elements": actionable.map(Self.summarise)
         ]
@@ -1121,6 +1128,7 @@ final class HarnessServer {
         }
         response["application"] = snapshot.applicationName
         response["bundleIdentifier"] = snapshot.bundleIdentifier
+        response["frontmostSource"] = snapshot.frontmostSource?.rawValue ?? NSNull()
         // Carried on every acting response, not just snapshot, because the
         // slow-walk anomaly rule has nothing else to compare.
         response["walkMilliseconds"] = Int(snapshot.walkDurationInSeconds * 1000)
@@ -1474,7 +1482,8 @@ final class HarnessServer {
         // runs. It is because the `expectApp` guard below and the menu bar it
         // guards must come from ONE answer; two sources let a race pass the
         // check against one app and read the menu bar of another.
-        guard let application = AccessibilityTreeWalker.focusedApplication() else {
+        let frontmostRead = AccessibilityTreeWalker.frontmost()
+        guard let application = frontmostRead.application else {
             fail("noFrontmostApplication", "nothing is frontmost")
             return nil
         }
@@ -1495,6 +1504,7 @@ final class HarnessServer {
         }
         response["application"] = application.localizedName ?? "unknown"
         response["bundleIdentifier"] = application.bundleIdentifier ?? "unknown"
+        response["frontmostSource"] = frontmostRead.source.rawValue
 
         guard let bar = AccessibilityMenu.menuBarNode(for: application) else {
             fail("noMenuBar", "the application publishes no AXMenuBar")
@@ -1790,7 +1800,7 @@ final class HarnessServer {
         let candidates = AccessibilityWindows.runningApplications()
 
         guard let query = request.app else {
-            guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+            guard let frontmost = AccessibilityTreeWalker.focusedApplication() else {
                 fail("noFrontmostApplication", "nothing is frontmost")
                 return nil
             }
@@ -2052,6 +2062,7 @@ final class HarnessServer {
             "observed": outcome.observed,
             "milliseconds": outcome.observedMilliseconds,
             "observedApplication": (outcome.observedApplication ?? NSNull()) as Any,
+            "observedVia": (outcome.observedVia ?? NSNull()) as Any,
             "observedWindowTitle": (outcome.observedWindowTitle?.raw ?? NSNull()) as Any
         ]
 
@@ -2565,6 +2576,7 @@ final class HarnessServer {
             rootNode = snapshot.rootNode
             response["application"] = snapshot.applicationName
             response["bundleIdentifier"] = snapshot.bundleIdentifier
+            response["frontmostSource"] = snapshot.frontmostSource?.rawValue ?? NSNull()
             response["walkMilliseconds"] = Int(snapshot.walkDurationInSeconds * 1000)
         } catch {
             response["snapshotError"] = Self.errorCode(for: error)
@@ -2614,6 +2626,7 @@ final class HarnessServer {
         outcome: String,
         startedAt: Date
     ) {
+        let frontmost = AccessibilityTreeWalker.frontmost()
         appendAudit(HarnessPolicy.auditLine(
             at: startedAt,
             id: request.id,
@@ -2623,13 +2636,15 @@ final class HarnessServer {
             target: request.title.isEmpty
                 ? (request.aimAtFocus ? "<focused>" : request.app)
                 : request.title,
-            app: Self.frontmostBundleIdentifier(),
+            app: frontmost.application?.bundleIdentifier,
             session: Self.sessionIdentifier,
             dryRun: dryRun,
             confirmed: request.confirmed,
             kernel: kernel,
             outcome: outcome,
-            milliseconds: elapsedMilliseconds(since: startedAt)
+            milliseconds: elapsedMilliseconds(since: startedAt),
+            frontmostSource: frontmost.source.rawValue,
+            frontmostSystemWideError: frontmost.systemWideErrorRawValue
         ))
     }
 

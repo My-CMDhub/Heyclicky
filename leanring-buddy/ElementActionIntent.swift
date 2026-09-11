@@ -559,7 +559,9 @@ enum AccessibilityTypePerformer {
     /// purpose: focus can be in a sheet or a popover the window walk pruned, and
     /// "not in the tree" would then be reported as "nothing has focus".
     static func focusedNode() -> AccessibilityElementNode? {
-        guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
+        // The walker's source, so the snapshot that guarded this and the focus
+        // it aims at name the same app.
+        guard let application = AccessibilityTreeWalker.focusedApplication() else { return nil }
         let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
 
         var focusedValue: AnyObject?

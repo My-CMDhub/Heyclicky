@@ -2378,6 +2378,29 @@ private func expectEverySuggestionResolvesToItsOwnCandidate(
     #expect(ApplicationLauncher.status(frontmostSeen: false, windowSeen: true, deadlinePassed: true) == .notReady)
 }
 
+// MARK: - Frontmost source
+//
+// Measured 2026-09-11: the system-wide read answers -25212 while an Electron app
+// is in front, so the cached fallback is common and must say which it was.
+
+@Test func aSystemWideAnswerIsAccessibilityWhateverTheCacheSays() async throws {
+    for cached in [true, false, nil] as [Bool?] {
+        #expect(AccessibilityTreeWalker.frontmostSource(systemWideAnswered: true, cachedApplicationSaysFrontmost: cached) == .accessibility)
+    }
+}
+
+@Test func aCacheTheAppItselfConfirmsIsLabelledConfirmed() async throws {
+    #expect(AccessibilityTreeWalker.frontmostSource(systemWideAnswered: false, cachedApplicationSaysFrontmost: true) == .cacheConfirmedByApp)
+}
+
+@Test func aCacheTheAppDeniesIsUnconfirmed() async throws {
+    #expect(AccessibilityTreeWalker.frontmostSource(systemWideAnswered: false, cachedApplicationSaysFrontmost: false) == .cacheUnconfirmed)
+}
+
+@Test func aFailedReadOfTheAppsOwnAnswerIsNotAYes() async throws {
+    #expect(AccessibilityTreeWalker.frontmostSource(systemWideAnswered: false, cachedApplicationSaysFrontmost: nil) == .cacheUnconfirmed)
+}
+
 
 @Test func aRunningAppOutsideTheSearchedFoldersResolvesByExactName() async throws {
     // Finder is in /System/Library/CoreServices, which name resolution does not
