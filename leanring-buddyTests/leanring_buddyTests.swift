@@ -1690,6 +1690,21 @@ private func menuItemNode(_ label: String) -> AccessibilityElementNode {
     // A miss says what WAS running, or it is not actionable.
     #expect(AccessibilityWindows.matchApplication("Xcode", among: candidates)
         == .notFound(available: ["Finder", "Mail", "MailMate"]))
+
+    // The name on disk is a tier of its own. Measured 2026-09-11: `launch
+    // "Visual Studio Code"` resolves the bundle by its folder name, but the
+    // running app calls itself "Code", so the same string was `notFound` to
+    // `focus`. Exact only, below the exact display name, above the prefix.
+    let withCode = candidates + [AccessibilityWindows.ApplicationCandidate(
+        bundleIdentifier: "com.microsoft.VSCode", localizedName: "Code", bundleName: "Visual Studio Code"
+    )]
+    #expect(AccessibilityWindows.matchApplication("visual studio code", among: withCode)
+        == .resolved(index: 3, tier: .bundleName))
+    #expect(AccessibilityWindows.matchApplication("Code", among: withCode)
+        == .resolved(index: 3, tier: .name))
+    // A prefix of the disk name is not a match — "Visual" reaches nothing.
+    #expect(AccessibilityWindows.matchApplication("Visual", among: withCode)
+        == .notFound(available: ["Code", "Finder", "Mail", "MailMate"]))
 }
 
 @Test func aWindowMatchesExactlyBeforeLooselyAndAPointOnlyDecidesWhenItIsAlone() async throws {

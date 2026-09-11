@@ -53,12 +53,20 @@ enum AccessibilityWindows {
     struct ApplicationCandidate: Equatable {
         let bundleIdentifier: String?
         let localizedName: String?
+        /// The `.app` folder's name without the extension — what `launch`
+        /// matches, and not always what the app calls itself once running
+        /// ("Visual Studio Code" on disk, "Code" in `localizedName`).
+        let bundleName: String?
         let isActive: Bool
         let isHidden: Bool
 
-        init(bundleIdentifier: String?, localizedName: String?, isActive: Bool = false, isHidden: Bool = false) {
+        init(
+            bundleIdentifier: String?, localizedName: String?, bundleName: String? = nil,
+            isActive: Bool = false, isHidden: Bool = false
+        ) {
             self.bundleIdentifier = bundleIdentifier
             self.localizedName = localizedName
+            self.bundleName = bundleName
             self.isActive = isActive
             self.isHidden = isHidden
         }
@@ -70,6 +78,7 @@ enum AccessibilityWindows {
     enum ApplicationMatchTier: String, Equatable, CaseIterable {
         case bundleIdentifier
         case name
+        case bundleName
         case namePrefix
     }
 
@@ -99,6 +108,7 @@ enum AccessibilityWindows {
         let tiers: [(ApplicationMatchTier, (ApplicationCandidate) -> Bool)] = [
             (.bundleIdentifier, { $0.bundleIdentifier?.lowercased() == wanted }),
             (.name, { $0.localizedName?.lowercased() == wanted }),
+            (.bundleName, { $0.bundleName?.lowercased() == wanted }),
             (.namePrefix, { $0.localizedName?.lowercased().hasPrefix(wanted) ?? false })
         ]
 
@@ -216,6 +226,7 @@ enum AccessibilityWindows {
                 (application, ApplicationCandidate(
                     bundleIdentifier: application.bundleIdentifier,
                     localizedName: application.localizedName,
+                    bundleName: application.bundleURL?.deletingPathExtension().lastPathComponent,
                     isActive: application.isActive,
                     isHidden: application.isHidden
                 ))
