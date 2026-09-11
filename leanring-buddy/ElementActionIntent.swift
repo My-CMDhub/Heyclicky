@@ -364,6 +364,8 @@ enum AccessibilitySelectionPerformer {
     enum Outcome: Equatable {
         /// `levelsAboveTarget` is 0 when the named element was itself selectable.
         case selected(path: SelectionPath, levelsAboveTarget: Int, milliseconds: Int, readBackTrue: Bool)
+        /// The container's selection already is this row. Nothing was written.
+        case alreadySelected(path: SelectionPath, levelsAboveTarget: Int)
         case writeFailed(error: AXError, levelsAboveTarget: Int, milliseconds: Int)
         case noSelectableAncestor(levelsInspected: Int)
         case noLiveElement
@@ -394,6 +396,26 @@ enum AccessibilitySelectionPerformer {
             if let container {
                 AXUIElementSetMessagingTimeout(container, selectionTimeoutInSeconds)
                 for attribute in containerSelectionAttributes where isSettable(container, attribute) {
+                    let path: SelectionPath = attribute == "AXSelectedRows" ? .containerSelectedRows : .containerSelectedChildren
+
+                    // Idempotence, read before writing. Measured 2026-09-11: a
+                    // redundant `select "Recent"` in Finder changed nothing and
+                    // cost the verifier its full 3,129 ms to say so.
+                    //
+                    // Asked of the CONTAINER, never the row's own `AXSelected`:
+                    // measured 2026-09-10, Finder's row reads back true after a
+                    // write that never navigated the window. The container write
+                    // is the one that navigates in System Settings and Finder, so
+                    // its value is the only trustworthy "already there". The
+                    // element-only path below has no such witness and still
+                    // writes, then verifies.
+                    var current: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(container, attribute as CFString, &current) == .success,
+                       let selectedElements = current as? [AXUIElement],
+                       selection(selectedElements, isExactly: element) {
+                        return .alreadySelected(path: path, levelsAboveTarget: levelsUp)
+                    }
+
                     let startedAt = Date()
                     let error = AXUIElementSetAttributeValue(
                         container, attribute as CFString, [element] as CFArray
@@ -402,7 +424,7 @@ enum AccessibilitySelectionPerformer {
                     lastError = error
                     guard error == .success else { continue }
                     return .selected(
-                        path: attribute == "AXSelectedRows" ? .containerSelectedRows : .containerSelectedChildren,
+                        path: path,
                         levelsAboveTarget: levelsUp,
                         milliseconds: lastMilliseconds,
                         readBackTrue: readsBackSelected(element)
@@ -448,6 +470,14 @@ enum AccessibilitySelectionPerformer {
         var readBack: AnyObject?
         AXUIElementCopyAttributeValue(element, selectedAttribute as CFString, &readBack)
         return (readBack as? Bool) == true
+    }
+
+    /// Exactly, not "contains": the write replaces the selection with `[element]`,
+    /// so a multi-selection that merely includes the row would still be narrowed
+    /// by it — skipping that write would be a no-op that is not one.
+    static func selection(_ selectedElements: [AXUIElement], isExactly element: AXUIElement) -> Bool {
+        selectedElements.count == 1
+            && AccessibilityElementKey(element: selectedElements[0]) == AccessibilityElementKey(element: element)
     }
 
     static func isSettable(_ element: AXUIElement, _ attribute: String) -> Bool {

@@ -836,6 +836,10 @@ enum AccessibilityDumpRunner {
             let selectedRole = chain[chain.count - 1 - levelsUp].role
             report.append("write: \(path.rawValue) — target \(selectedRole), \(levelsUp) level(s) above the named element, \(milliseconds) ms")
             report.append("read back: AXSelected is \(readBackTrue ? "true" : "NOT true — the write was accepted and ignored")")
+        case .alreadySelected(let path, let levelsUp):
+            report.append("write: skipped — \(path.rawValue) already is exactly this element, \(levelsUp) level(s) up; nothing written, nothing to verify")
+            finishSelect(report)
+            return
         case .writeFailed(let error, let levelsUp, let milliseconds):
             report.append("write: FAILED AXError \(error.rawValue) at \(levelsUp) level(s) up after \(milliseconds) ms")
             finishSelect(report)
@@ -864,6 +868,8 @@ enum AccessibilityDumpRunner {
                 let appeared = namedElementFingerprint(in: laterRoot).subtracting(namesBefore).sorted()
                 report.append("  appeared: \(appeared.isEmpty ? "(none)" : appeared.prefix(8).joined(separator: ", "))")
             }
+        case .windowGone(let milliseconds):
+            report.append("verified: the focused window closed after \(milliseconds) ms — the app reacted")
         case .notObserved(let milliseconds):
             report.append("verified: NOTHING CHANGED in \(milliseconds) ms — the write landed and the app ignored it")
         case .couldNotReadWindow:

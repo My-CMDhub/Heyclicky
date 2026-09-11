@@ -2216,3 +2216,94 @@ private func expectEverySuggestionResolvesToItsOwnCandidate(
     #expect(bareSuggestions.map(\.suggestedWithinNamed) == [nil, "Recent"])
     expectEverySuggestionResolvesToItsOwnCandidate(bareSuggestions, intent: intent, root: bare)
 }
+
+// MARK: - Verification: the gap decision and the idempotent select
+//
+// `ActionVerifier.verify` and the selection write are cross-process; only the
+// decisions behind them are tested here.
+
+@Test func twoConsecutiveMissingWindowsMeanTheWindowIsGone() async throws {
+    // TextEdit File > Close on its last window, 2026-09-11: every poll threw
+    // noFocusedWindow and the harness called a success notVerified.
+    let gap: Error? = AccessibilitySnapshotError.noFocusedWindow
+    #expect(ActionVerifier.outcome(afterPolls: [gap], elapsedMilliseconds: 10) == nil)
+    #expect(ActionVerifier.outcome(afterPolls: [gap, gap], elapsedMilliseconds: 160) == .windowGone(afterMilliseconds: 160))
+}
+
+@Test func aSnapshotBetweenTwoGapsIsAWindowSwitchNotAClose() async throws {
+    let gap: Error? = AccessibilitySnapshotError.noFocusedWindow
+    #expect(ActionVerifier.outcome(afterPolls: [gap, nil], elapsedMilliseconds: 160) == nil)
+    #expect(ActionVerifier.outcome(afterPolls: [gap, nil, gap], elapsedMilliseconds: 310) == nil)
+}
+
+@Test func failingToLookIsNeverEvidenceTheWindowClosed() async throws {
+    let locked: Error? = AccessibilitySnapshotError.screenIsLocked
+    let gap: Error? = AccessibilitySnapshotError.noFocusedWindow
+    #expect(ActionVerifier.outcome(afterPolls: [locked, locked], elapsedMilliseconds: 160) == nil)
+    #expect(ActionVerifier.outcome(afterPolls: [gap, locked], elapsedMilliseconds: 160) == nil)
+    #expect(ActionVerifier.outcome(
+        afterPolls: [AccessibilitySnapshotError.accessibilityPermissionNotGranted, AccessibilitySnapshotError.noFrontmostApplication],
+        elapsedMilliseconds: 160
+    ) == nil)
+}
+
+@Test func alreadySelectedMeansTheSelectionIsExactlyThisElement() async throws {
+    // Real handles, no IPC: creating an application element is local, and two
+    // separately created ones for the same pid are CFEqual — identity, not pointer.
+    let row = AXUIElementCreateApplication(1)
+    let sameRowFreshHandle = AXUIElementCreateApplication(1)
+    let otherRow = AXUIElementCreateApplication(2)
+
+    #expect(AccessibilitySelectionPerformer.selection([sameRowFreshHandle], isExactly: row))
+    #expect(AccessibilitySelectionPerformer.selection([otherRow], isExactly: row) == false)
+    #expect(AccessibilitySelectionPerformer.selection([], isExactly: row) == false)
+    // The write replaces the selection with [row], so a multi-selection that
+    // includes it would still change — skipping it would not be a no-op.
+    #expect(AccessibilitySelectionPerformer.selection([sameRowFreshHandle, otherRow], isExactly: row) == false)
+}
+
+// MARK: - expectApp — focus moved under a planner, 2026-09-11
+
+@Test func expectAppTravelsWithAnActingVerbAndIsNilWhenAbsent() async throws {
+    guard case .success(let expecting) = HarnessPolicy.decode(
+        line: #"{"id":"e1","verb":"menu","path":["File","Close Window"],"expectApp":"com.apple.finder"}"#
+    ), case .success(let plain) = HarnessPolicy.decode(
+        line: #"{"id":"e2","verb":"press","title":"About"}"#
+    ) else {
+        Issue.record("expected both requests to decode")
+        return
+    }
+    #expect(expecting.expectApp == "com.apple.finder")
+    #expect(plain.expectApp == nil)
+}
+
+@Test func anEmptyExpectAppIsRefusedRatherThanReadAsNoGuard() async throws {
+    guard case .failure(let error) = HarnessPolicy.decode(
+        line: #"{"id":"e3","verb":"press","title":"About","expectApp":""}"#
+    ) else {
+        Issue.record("expected a refusal")
+        return
+    }
+    #expect(error == .invalidField(field: "expectApp", value: ""))
+}
+
+@Test func appMatchesIsCaseInsensitiveExactAndNeverAPrefix() async throws {
+    #expect(HarnessPolicy.appMatches(expected: "COM.APPLE.FINDER", bundleIdentifier: "com.apple.finder", name: "Finder"))
+    #expect(HarnessPolicy.appMatches(expected: "finder", bundleIdentifier: "com.apple.finder", name: "Finder"))
+    #expect(HarnessPolicy.appMatches(expected: "Finder", bundleIdentifier: "com.anthropic.claudefordesktop", name: "Claude") == false)
+    // A prefix is a guess about which app to act in.
+    #expect(HarnessPolicy.appMatches(expected: "Find", bundleIdentifier: "com.apple.finder", name: "Finder") == false)
+    #expect(HarnessPolicy.appMatches(expected: "finder", bundleIdentifier: nil, name: "Finder"))
+}
+
+@Test func aWindowCannotBeGoneIfNoneWasFocusedBeforeTheAction() async throws {
+    // A menu can be pressed in an app with no window at all. "No focused window"
+    // afterwards is then the same nothing as before, not a window that closed —
+    // and reading it as `.windowGone` would confirm a no-op. Found in review,
+    // 2026-09-11, before it shipped.
+    let twoGaps: [Error?] = [AccessibilitySnapshotError.noFocusedWindow, AccessibilitySnapshotError.noFocusedWindow]
+    #expect(ActionVerifier.outcome(afterPolls: twoGaps, elapsedMilliseconds: 300, hadFocusedWindowBefore: false) == nil)
+    // The same two gaps after acting in a real window are the close they look like.
+    #expect(ActionVerifier.outcome(afterPolls: twoGaps, elapsedMilliseconds: 300, hadFocusedWindowBefore: true)
+        == .windowGone(afterMilliseconds: 300))
+}

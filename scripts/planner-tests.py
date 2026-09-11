@@ -44,13 +44,25 @@ def send(request, timeout=40.0):
 class Run:
     """One task's trail: every request as a short record, plus the counters."""
 
+    # Verbs that read "the frontmost app" and so must say which app they mean.
+    APP_SCOPED_VERBS = {"snapshot", "press", "select", "type", "open", "menu", "menus", "look"}
+
     def __init__(self, task_id):
         self.task_id = task_id
         self.records = []
         self.images = 0
         self.rungs = []
+        self.app = None
+        self.recoveries = 0
 
-    def call(self, request, note=""):
+    def call(self, request, note="", retried=False):
+        # Every app-scoped request names the app the plan is working in.
+        # Measured 2026-09-11: focus moved to another app between a confirmed
+        # `focus` and the next request, and a menu press read Claude's menu bar
+        # while the plan meant Finder's. Without this, "File > Close Window"
+        # would have closed a window in the wrong application.
+        if self.app and request["verb"] in self.APP_SCOPED_VERBS and "expectApp" not in request:
+            request = dict(request, expectApp=self.app)
         request = dict(request, id=f"{self.task_id}-{len(self.records)}")
         started = time.time()
         response = send(request)
@@ -64,14 +76,32 @@ class Run:
             "ms": int((time.time() - started) * 1000),
             "note": note,
         }
+        # A failure has to explain itself. Measured 2026-09-11: a menu press came
+        # back notFound in 13 ms and the short record could not say which menu
+        # level was missing or which app the harness thought was in front.
+        if not response.get("ok"):
+            record["application"] = response.get("application")
+            record["resolution"] = response.get("resolution")
+            record["reason"] = (response.get("kernel") or {}).get("reason") or response.get("message")
         if response.get("imagePath") or (response.get("escalation") or {}).get("imagePath"):
             self.images += 1
         self.records.append(record)
+
+        # Recovery from a step that failed halfway, bounded to ONE retry and only
+        # for a precondition the planner can restore. A kernel refusal is a
+        # decision, never retried; a second frontmostChanged is reported as is.
+        if response.get("error") == "frontmostChanged" and not retried:
+            self.recoveries += 1
+            self.call({"verb": "focus", "app": self.app}, note="recover: re-pin focus")
+            time.sleep(0.8)
+            return self.call({k: v for k, v in request.items() if k != "id"}, note="recover: retry once", retried=True)
         return response
 
     def focus(self, app):
         # Focus drifts between requests on this machine (measured 2026-09-11),
-        # so every step that depends on the front app pins it first.
+        # so every step that depends on the front app pins it first — and the
+        # app becomes the expectApp every later app-scoped request carries.
+        self.app = app
         self.call({"verb": "focus", "app": app}, note="pin focus")
         time.sleep(0.8)
 
@@ -133,6 +163,9 @@ def open_settings_fresh(run, deadline_seconds=8.0):
     until = time.time() + deadline_seconds
     while time.time() < until:
         if run.call({"verb": "focus", "app": "System Settings"}, note="wait for launch").get("ok"):
+            # Same as Run.focus: the app just pinned is the one every later
+            # app-scoped request must name, or the frontmost guard never runs.
+            run.app = "System Settings"
             time.sleep(1.0)
             return True
         time.sleep(0.4)
@@ -202,13 +235,17 @@ def task_finder_ambiguous_sidebar_row(run, failures):
         check(chosen.get("frame") is not None and (response.get("resolved") or {}).get("frame") == chosen["frame"],
               "the harness acted on a different element than the candidate the planner chose", failures)
         # The row is already selected — the window is named after it, which is
-        # exactly why the name is ambiguous. So nothing changes, and the honest
-        # report is notObserved. Measured 2026-09-11: it is, after 3,129 ms. A
-        # "confirmed" here would be the verifier claiming a change that never
-        # happened, and that is the failure this line exists to catch.
-        check((response.get("verification") or {}).get("status") == "notObserved",
-              f"a no-op select was reported as {(response.get('verification') or {}).get('status')!r}, "
-              "not notObserved", failures)
+        # exactly why the name is ambiguous. Measured 2026-09-11 before the
+        # idempotence check: nothing changed and the verifier said notObserved
+        # only after 3,129 ms, a cost paid on every redundant step. Now the
+        # container's own selection is read first, so the honest answer is
+        # "already there", nothing written, nothing to verify — and a
+        # "confirmed" would be a change claimed that never happened.
+        performed = (response.get("performed") or {}).get("status")
+        verification = (response.get("verification") or {}).get("status")
+        check(performed == "alreadySelected" and verification == "notNeeded",
+              f"an already-selected row was reported as performed={performed!r} verification={verification!r}",
+              failures)
         check((run.window_titles("Finder") or [None])[0] == "Recent", "window left Recent", failures)
     finally:
         run.focus("Finder")
@@ -298,7 +335,7 @@ def main():
         results.append({
             "task": task_id, "title": title, "passed": not failures, "failures": failures,
             "seconds": round(time.time() - started, 1), "requests": len(run.records),
-            "rungs": run.rungs, "images": run.images,
+            "rungs": run.rungs, "images": run.images, "recoveries": run.recoveries,
             "historyBytes": len(json.dumps(run.records)), "records": run.records,
         })
 
@@ -306,11 +343,11 @@ def main():
     with open(REPORT_PATH, "w") as report:
         json.dump(results, report, indent=1)
 
-    print(f"{'task':<4} {'result':<6} {'secs':>5} {'reqs':>4} {'imgs':>4} {'hist B':>6}  rungs / failures")
+    print(f"{'task':<4} {'result':<6} {'secs':>5} {'reqs':>4} {'imgs':>4} {'recov':>5} {'hist B':>6}  rungs / failures")
     for r in results:
         detail = ", ".join(r["rungs"]) + ("" if r["passed"] else "  |  " + "; ".join(r["failures"]))
         print(f"{r['task']:<4} {'PASS' if r['passed'] else 'FAIL':<6} {r['seconds']:>5} "
-              f"{r['requests']:>4} {r['images']:>4} {r['historyBytes']:>6}  {detail}")
+              f"{r['requests']:>4} {r['images']:>4} {r['recoveries']:>5} {r['historyBytes']:>6}  {detail}")
     passed = sum(r["passed"] for r in results)
     print(f"\n{passed} of {len(results)} passed — full trail in {REPORT_PATH}")
     sys.exit(0 if passed == len(results) else 1)

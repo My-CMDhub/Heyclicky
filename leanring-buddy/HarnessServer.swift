@@ -45,6 +45,10 @@ struct HarnessRawRequest: Decodable {
     /// Absent means the frontmost one, which is what every other verb assumes.
     let app: String?
 
+    /// Every verb that reads "the frontmost app": refuse unless that app is this
+    /// one, by bundle identifier or name. See `HarnessPolicy.appMatches`.
+    let expectApp: String?
+
     // type only
     let text: String?
     let mode: String?
@@ -187,6 +191,10 @@ struct HarnessRequest: Equatable {
     /// windows / focus only. nil means the frontmost application.
     var app: String? = nil
 
+    /// snapshot / press / select / type / open / menu / menus / look. nil means
+    /// no expectation — act in whatever is in front, exactly as before.
+    var expectApp: String? = nil
+
     /// look only. nil means "choose the rung".
     var tier: EscalationLadder.Tier? = nil
     /// Acting verbs only: whether a failed resolution should pay for a capture.
@@ -263,6 +271,13 @@ enum HarnessPolicy {
             tier = parsed
         }
 
+        // An empty expectation is refused, not read as "none": a planner that
+        // sends `""` meant to name an app, and silently dropping the guard is
+        // the near-miss-turned-default this interface refuses everywhere else.
+        if raw.expectApp?.isEmpty == true {
+            return .failure(.invalidField(field: "expectApp", value: ""))
+        }
+
         var mode = TypeMode.insert
         if verb == .type {
             guard !(raw.text ?? "").isEmpty else {
@@ -296,9 +311,20 @@ enum HarnessPolicy {
             thenConfirm: raw.thenConfirm ?? false,
             path: path,
             app: (raw.app?.isEmpty == false) ? raw.app : nil,
+            expectApp: raw.expectApp,
             tier: tier,
             escalate: raw.escalate ?? false
         ))
+    }
+
+    /// Whether the app a verb actually read is the one the caller expected.
+    ///
+    /// Case-insensitive exact equality, and nothing fuzzier. Measured
+    /// 2026-09-11: `focus Finder` confirmed, 0.8 s later `menu File > …` read
+    /// Claude Desktop's menu bar — which also has "Close Window". A prefix or
+    /// contains match here would be a guess about which app to act in.
+    static func appMatches(expected: String, bundleIdentifier: String?, name: String?) -> Bool {
+        [bundleIdentifier, name].contains { $0?.caseInsensitiveCompare(expected) == .orderedSame }
     }
 
     /// A request may turn a dry run **on**; it may never turn one off.
@@ -902,6 +928,43 @@ final class HarnessServer {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier
     }
 
+    /// The refusal for a request whose `expectApp` is not the app it just read,
+    /// already audited — or nil when the verb may go on.
+    ///
+    /// Called with the app the verb is ABOUT TO USE (the snapshot's, the menu
+    /// bar's), never a separate lookup: a guard that reads a different answer
+    /// from the thing it guards can pass against one app while acting in another.
+    /// Without `expectApp` this returns nil and the request runs byte-for-byte
+    /// as it did before the field existed.
+    ///
+    /// `frontmostChanged` is deliberately not an ordinary refusal: focus moving
+    /// under a planner trips the flight recorder's `unexpectedError` rule, and
+    /// the per-rule-per-app suppression keeps a flood to one file a minute.
+    private func frontmostChangedRefusal(
+        _ request: HarnessRequest,
+        name: String?,
+        bundleIdentifier: String?,
+        dryRun: Bool,
+        startedAt: Date
+    ) -> [String: Any]? {
+        guard let expected = request.expectApp,
+              !HarnessPolicy.appMatches(expected: expected, bundleIdentifier: bundleIdentifier, name: name)
+        else { return nil }
+        audit(request, dryRun: dryRun, kernel: "n/a", outcome: "frontmostChanged", startedAt: startedAt)
+        return [
+            "ok": false,
+            "error": "frontmostChanged",
+            "expectedApp": expected,
+            "actualApp": [
+                "name": name.map { $0 as Any } ?? NSNull(),
+                "bundleIdentifier": bundleIdentifier.map { $0 as Any } ?? NSNull()
+            ],
+            "message": "focus is not on the expected application \(UntrustedText(expected).forDisplay) — "
+                + "\(UntrustedText(name ?? bundleIdentifier ?? "unknown").forDisplay) is frontmost, "
+                + "so nothing was resolved or performed"
+        ]
+    }
+
     private func execute(_ request: HarnessRequest, startedAt: Date) -> [String: Any] {
         let dryRun = HarnessPolicy.effectiveDryRun(
             requested: request.requestedDryRun,
@@ -963,6 +1026,11 @@ final class HarnessServer {
             return ["ok": false, "error": code, "message": String(describing: error)]
         }
 
+        if let refusal = frontmostChangedRefusal(
+            request, name: snapshot.applicationName, bundleIdentifier: snapshot.bundleIdentifier,
+            dryRun: dryRun, startedAt: startedAt
+        ) { return refusal }
+
         guard let rootNode = snapshot.rootNode else {
             audit(request, dryRun: dryRun, kernel: "n/a", outcome: "noRootNode", startedAt: startedAt)
             return ["ok": false, "error": "noRootNode", "message": "the walk produced no root element"]
@@ -1021,6 +1089,13 @@ final class HarnessServer {
             response["message"] = String(describing: error)
             return response
         }
+
+        // Before the intent is resolved, so a moved focus never gets as far as
+        // naming an element — let alone pressing one — in the wrong app.
+        if let refusal = frontmostChangedRefusal(
+            request, name: snapshot.applicationName, bundleIdentifier: snapshot.bundleIdentifier,
+            dryRun: dryRun, startedAt: startedAt
+        ) { return response.merging(refusal) { _, new in new } }
 
         guard let rootNode = snapshot.rootNode else {
             audit(request, dryRun: dryRun, kernel: "n/a", outcome: "noRootNode", startedAt: startedAt)
@@ -1200,6 +1275,22 @@ final class HarnessServer {
                     "readBackSelected": readBackTrue
                 ]
                 performedOK = true
+            case .alreadySelected(let path, let levelsUp):
+                // Nothing was written, so a second walk could only ever report
+                // notObserved — after the full 3 s.
+                response["performed"] = [
+                    "status": "alreadySelected",
+                    "selectionPath": path.rawValue,
+                    "levelsAboveNamedElement": levelsUp,
+                    "selectedRole": chain[chain.count - 1 - levelsUp].role
+                ]
+                response["verification"] = [
+                    "status": "notNeeded",
+                    "reason": "the container's selection already is exactly this row — nothing was written, so there is nothing to verify"
+                ]
+                response["ok"] = true
+                audit(request, dryRun: dryRun, kernel: described.decision, outcome: "alreadySelected", startedAt: startedAt)
+                return response
             case .writeFailed(let error, let levelsUp, let milliseconds):
                 response["performed"] = [
                     "status": "failed",
@@ -1291,7 +1382,17 @@ final class HarnessServer {
                 )
             }
             response["verification"] = [
-                "status": "confirmed", "milliseconds": milliseconds, "appeared": appeared
+                "status": "confirmed", "evidence": "named elements changed",
+                "milliseconds": milliseconds, "appeared": appeared
+            ]
+            response["ok"] = true
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "confirmed", startedAt: startedAt)
+        case .windowGone(let milliseconds):
+            // "The app reacted" is all a fingerprint change ever proved, and the
+            // window we acted in vanishing is the same evidence.
+            response["verification"] = [
+                "status": "confirmed", "evidence": "the focused window closed",
+                "milliseconds": milliseconds, "appeared": [String]()
             ]
             response["ok"] = true
             audit(request, dryRun: dryRun, kernel: described.decision, outcome: "confirmed", startedAt: startedAt)
@@ -1352,7 +1453,12 @@ final class HarnessServer {
             audit(request, dryRun: dryRun, kernel: "n/a", outcome: code, startedAt: startedAt)
         }
 
-        guard let application = NSWorkspace.shared.frontmostApplication else {
+        // The same source `snapshotFocusedWindow` reads, and not because
+        // `NSWorkspace` lags here — measured 2026-09-11, 0 disagreements in 8
+        // runs. It is because the `expectApp` guard below and the menu bar it
+        // guards must come from ONE answer; two sources let a race pass the
+        // check against one app and read the menu bar of another.
+        guard let application = AccessibilityTreeWalker.focusedApplication() else {
             fail("noFrontmostApplication", "nothing is frontmost")
             return nil
         }
@@ -1360,6 +1466,15 @@ final class HarnessServer {
         // frontmost, and its menu bar is a believable, wrong answer.
         guard !LockScreenGuard.isLockScreen(application.bundleIdentifier) else {
             fail("screenIsLocked", "the screen is locked — there is no menu bar of the user's to read")
+            return nil
+        }
+        // Measured 2026-09-11: after a confirmed `focus Finder`, `menu` read
+        // Claude Desktop's bar. Checked before one menu item is read.
+        if let refusal = frontmostChangedRefusal(
+            request, name: application.localizedName, bundleIdentifier: application.bundleIdentifier,
+            dryRun: dryRun, startedAt: startedAt
+        ) {
+            response.merge(refusal) { _, new in new }
             return nil
         }
         response["application"] = application.localizedName ?? "unknown"
@@ -1505,7 +1620,9 @@ final class HarnessServer {
             return response
         }
 
-        let verification = ActionVerifier.verify { laterSnapshot in
+        // A menu works with no window open, and then "no focused window" after
+        // the press is not a window that closed. See `ActionVerifier.verify`.
+        let verification = ActionVerifier.verify(hadFocusedWindowBefore: namesBefore != nil) { laterSnapshot in
             if let windowsBefore,
                AccessibilityMenu.windowCount(for: application) != windowsBefore { return true }
             guard let laterRoot = laterSnapshot.rootNode, let namesBefore else { return false }
@@ -1514,9 +1631,25 @@ final class HarnessServer {
 
         switch verification {
         case .confirmed(let milliseconds):
+            // Either baseline can confirm here, so say which one did.
+            let windowsAfter = AccessibilityMenu.windowCount(for: application)
             response["verification"] = [
                 "status": "confirmed",
+                "evidence": windowsBefore != nil && windowsAfter != windowsBefore
+                    ? "the window count changed" : "named elements changed",
                 "milliseconds": milliseconds,
+                "windowsAfter": (windowsAfter ?? NSNull()) as Any
+            ]
+            response["ok"] = true
+            audit(request, dryRun: dryRun, kernel: described.decision, outcome: "confirmed", startedAt: startedAt)
+        case .windowGone(let milliseconds):
+            // Measured 2026-09-11: TextEdit File > Close on its last window. The
+            // count-change check never ran — every poll threw before reaching it.
+            response["verification"] = [
+                "status": "confirmed",
+                "evidence": "the focused window closed",
+                "milliseconds": milliseconds,
+                "appeared": [String](),
                 "windowsAfter": (AccessibilityMenu.windowCount(for: application) ?? NSNull()) as Any
             ]
             response["ok"] = true
@@ -2255,7 +2388,7 @@ final class HarnessServer {
         // read moments ago in this request, so the app walked is the app shot.
         guard let plan = escalationPlan(
             forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode,
-            application: NSWorkspace.shared.frontmostApplication
+            application: AccessibilityTreeWalker.focusedApplication()
         ) else { return }
 
         let result = escalationPayload(plan: plan, capture: request.escalate)
@@ -2311,13 +2444,22 @@ final class HarnessServer {
             response["walkMilliseconds"] = Int(snapshot.walkDurationInSeconds * 1000)
         } catch {
             response["snapshotError"] = Self.errorCode(for: error)
-            response["application"] = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+            response["application"] = AccessibilityTreeWalker.focusedApplication()?.localizedName ?? "unknown"
             response["bundleIdentifier"] = Self.frontmostBundleIdentifier() ?? "unknown"
         }
 
+        // Against whichever app this response says it read — the walked one, or
+        // on a failed walk the fallback the display rung is about to shoot.
+        // Before any capture: a photograph of the wrong app is still a leak.
+        if let refusal = frontmostChangedRefusal(
+            request, name: response["application"] as? String,
+            bundleIdentifier: response["bundleIdentifier"] as? String,
+            dryRun: dryRun, startedAt: startedAt
+        ) { return response.merging(refusal) { _, new in new } }
+
         guard let plan = escalationPlan(
             forcedTier: request.tier, title: request.title, role: request.role, rootNode: rootNode,
-            application: NSWorkspace.shared.frontmostApplication
+            application: AccessibilityTreeWalker.focusedApplication()
         ) else {
             return fail(
                 "notFound",

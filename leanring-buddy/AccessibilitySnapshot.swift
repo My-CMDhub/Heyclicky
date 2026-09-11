@@ -363,6 +363,37 @@ enum AccessibilityTreeWalker {
         }
     }
 
+    /// The application that has focus, asked of Accessibility — not of
+    /// `NSWorkspace`, whose answer is a cache refreshed on the main run loop.
+    ///
+    /// Third time this trap has cost a result, measured 2026-09-11. Socket
+    /// requests run inside `DispatchQueue.main.sync`, so the run loop cannot
+    /// turn during one, and `NSWorkspace.shared.frontmostApplication` stays
+    /// frozen at whatever was in front when the request began. Pressing
+    /// Apple > System Settings… from Finder opened System Settings and brought
+    /// it forward, and the verifier — re-walking "the focused window" — kept
+    /// walking Finder for 3,005 ms and reported `notObserved`. The very next
+    /// request read System Settings. The same freeze made
+    /// `focusChangedDuringWalk` unable ever to fire inside a request.
+    ///
+    /// Falls back to `NSWorkspace` only when Accessibility cannot answer; between
+    /// requests the run loop has turned and that value is current. `focus`
+    /// keeps its own read deliberately, with no fallback, because a stale
+    /// fallback there would reintroduce the exact bug it measures.
+    static func focusedApplication() -> NSRunningApplication? {
+        var value: AnyObject?
+        if AXUIElementCopyAttributeValue(
+            AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &value
+        ) == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
+            var processIdentifier: pid_t = 0
+            if AXUIElementGetPid(value as! AXUIElement, &processIdentifier) == .success,
+               let application = NSRunningApplication(processIdentifier: processIdentifier) {
+                return application
+            }
+        }
+        return NSWorkspace.shared.frontmostApplication
+    }
+
     /// Walks the focused window of the frontmost application.
     ///
     /// Every attribute read below is synchronous inter-process communication
@@ -380,7 +411,10 @@ enum AccessibilityTreeWalker {
             throw AccessibilitySnapshotError.accessibilityPermissionNotGranted
         }
 
-        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else {
+        // Bounded before the first cross-process read, which is now the one below.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)
+
+        guard let frontmostApplication = focusedApplication() else {
             throw AccessibilitySnapshotError.noFrontmostApplication
         }
 
@@ -500,7 +534,7 @@ enum AccessibilityTreeWalker {
         // NSScreen.screens[0] is always the display whose origin is (0, 0) —
         // the one AX measures every other display relative to.
         let primaryDisplayHeightInPoints = NSScreen.screens.first?.frame.height ?? 0
-        let frontmostAtStart = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let frontmostAtStart = AccessibilityTreeWalker.focusedApplication()?.processIdentifier
 
         var budget = AccessibilityWalkBudget(
             maximumDepth: maximumDepth,
@@ -565,7 +599,7 @@ enum AccessibilityTreeWalker {
         // Compared against the frontmost app at the START of the walk rather
         // than the walked app, which for a background window is never in front.
         let focusChangedDuringWalk =
-            NSWorkspace.shared.frontmostApplication?.processIdentifier != frontmostAtStart
+            AccessibilityTreeWalker.focusedApplication()?.processIdentifier != frontmostAtStart
 
         return AccessibilityWindowSnapshot(
             rootNode: rootNode,
